@@ -34,14 +34,22 @@ try:
     # Third Party
     from vllm.attention.backends.flash_attn import FlashAttentionMetadata
 except (ModuleNotFoundError, ImportError):
-    # vllm_flash_attn is not installed, try the ROCm FA metadata
-    from vllm.attention.backends.rocm_flash_attn import (
-        ROCmFlashAttentionMetadata as FlashAttentionMetadata,
-    )
-
+    if hasattr(torch, "hpu") and torch.hpu.is_available():
+        # Third Party
+        from vllm.attention.backends.hpu_attn import HPUAttentionMetadata
+    else:
+        # vllm_flash_attn is not installed, try the ROCm FA metadata
+        # Third Party
+        from vllm.attention.backends.rocm_flash_attn import (
+            ROCmFlashAttentionMetadata as FlashAttentionMetadata,
+        )
+try:
+    # Third Party
+    from vllm.attention.backends.flashmla import FlashMLAMetadata
+    from vllm.attention.backends.mla.common import MLACommonMetadata
+except (ModuleNotFoundError, ImportError):
+    pass
 # Third Party
-from vllm.attention.backends.flashmla import FlashMLAMetadata
-from vllm.attention.backends.mla.common import MLACommonMetadata
 from vllm.config import (
     CacheConfig,
     ModelConfig,
@@ -69,13 +77,15 @@ from lmcache.v1.gpu_connector import (
 
 logger = init_logger(__name__)
 
-LMCACHE_CUDA_STREAM = torch.cuda.Stream()
-
-SUPPORTED_BACKEND_METADATA = (
-    FlashAttentionMetadata,
-    FlashMLAMetadata,
-    MLACommonMetadata,
-)
+if hasattr(torch, "hpu") and torch.hpu.is_available():
+    SUPPORTED_BACKEND_METADATA = HPUAttentionMetadata
+else:
+    LMCACHE_CUDA_STREAM = torch.cuda.Stream()
+    SUPPORTED_BACKEND_METADATA = (
+        FlashAttentionMetadata,
+        FlashMLAMetadata,
+        MLACommonMetadata,
+    )
 
 VLLM_CACHE_CONFIG: Optional[CacheConfig] = None
 VLLM_MODEL_CONFIG: Optional[ModelConfig] = None
@@ -169,8 +179,11 @@ def init_lmcache_engine(
     logger.info(f"use mla: {use_mla}, kv shape: {kv_shape}")
 
     # Change current device.
-    torch.cuda.device(parallel_config.rank)
-    device = torch.device(f"cuda:{parallel_config.rank}")
+    if hasattr(torch, "hpu") and torch.hpu.is_available():
+        device = torch.device(f"hpu:{parallel_config.rank}")
+    else:
+        torch.cuda.device(parallel_config.rank)
+        device = torch.device(f"cuda:{parallel_config.rank}")
     metadata = LMCacheEngineMetadata(
         model_config.model,
         parallel_config.world_size,
