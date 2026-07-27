@@ -33,6 +33,11 @@ from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.mq import MessageQueueClient
+from lmcache.v1.multiprocess.transfer_plan import (
+    KernelGroupGeometry,
+    ObjectGroupGeometry,
+    build_object_group_transfer_plan,
+)
 
 if TYPE_CHECKING:
     # First Party
@@ -345,6 +350,32 @@ def compute_kv_layout(
     )
 
 
+def _uniform_object_group_geometry(
+    blocks_per_chunk: int,
+    block_size: int,
+    tokens_per_chunk: int,
+) -> ObjectGroupGeometry:
+    """Geometry for the engine-driven path's single native gather/scatter.
+
+    One ``multi_layer_block_kv_transfer`` covers every layer of one LMCache
+    group in a single call, so the object group has exactly one kernel group
+    with full-attention coverage (window == chunk) and no sliding window.
+    """
+    return ObjectGroupGeometry(
+        object_group_id=0,
+        kernel_groups=(
+            KernelGroupGeometry(
+                kernel_group_id=0,
+                blocks_per_chunk=blocks_per_chunk,
+                blocks_per_window=blocks_per_chunk,
+                tokens_to_blocks=lambda tokens: tokens // block_size,
+            ),
+        ),
+        tokens_per_chunk=tokens_per_chunk,
+        num_chunks_in_sw=-1,
+    )
+
+
 def gather_paged_kv_to_cpu(
     kv_caches: dict[str, torch.Tensor],
     block_ids: list[int],
@@ -536,22 +567,28 @@ def gather_paged_kv_to_cpu(
                 selected_block_ids, dtype=torch.int64, device=tensors[0].device
             )
 
-            # Split transfer to respect CUDA kernel's object count limitation
+            # The native kernel caps each call at MAX_OBJECTS objects. Plan the
+            # batched walk with the shared transfer planner so the engine-driven
+            # store batches identically to the lmcache-driven path. A store
+            # writes every gathered chunk, so skip_first_n_tokens is 0 and no
+            # block is skipped.
             MAX_OBJECTS = 4
-            req_blocks_per_obj = blocks_per_chunk
-            total_objects = len(objs_arg)
-
-            for i in range(0, total_objects, MAX_OBJECTS):
-                # Slice object pointers and corresponding block IDs
-                batch_objs_ptrs = objs_arg[i : i + MAX_OBJECTS]
-
-                start_block = i * req_blocks_per_obj
-                end_block = min(
-                    (i + MAX_OBJECTS) * req_blocks_per_obj, len(selected_block_ids)
-                )
-                batch_blocks = block_ids_arg[start_block:end_block]
-
-                # Execute batched transfer
+            geometry = _uniform_object_group_geometry(
+                blocks_per_chunk, block_size, chunk_tokens
+            )
+            plan = build_object_group_transfer_plan(
+                geometry,
+                present=[True] * len(objs_arg),
+                batch_size=MAX_OBJECTS,
+                skip_first_n_tokens=0,
+                is_h2d=False,
+            )
+            for step in plan:
+                batch_objs_ptrs = [objs_arg[k] for k in step.object_indices]
+                launch = step.launches[0]
+                batch_blocks = block_ids_arg[
+                    launch.start_block_pos : launch.start_block_pos + launch.num_blocks
+                ]
                 lmc_ops.multi_layer_block_kv_transfer(
                     paged_arg,
                     batch_objs_ptrs,
@@ -561,7 +598,7 @@ def gather_paged_kv_to_cpu(
                     shape_desc,
                     chunk_tokens,
                     engine_kv_format,
-                    0,
+                    launch.skip_blocks,
                 )
 
     # --- Final reconciliation ---
@@ -731,24 +768,28 @@ def scatter_cpu_to_paged_kv(
             selected_block_ids, dtype=torch.int64, device=tensors[0].device
         )
 
-        # Batched transfer to satisfy cuda's limitation (max 4 objects)
+        # The native kernel caps each call at MAX_OBJECTS objects. Plan the
+        # batched walk with the shared transfer planner: it drops batches that
+        # fall wholly inside skip_first_n_tokens and carries the residual skip
+        # on the straddling batch, so a skip spanning more than one batch is
+        # honored per batch (the earlier code skipped only the first batch).
         MAX_OBJECTS = 4
-        req_blocks_per_obj = (
-            blocks_per_chunk  # Each chunk corresponds to one object's blocks
+        geometry = _uniform_object_group_geometry(
+            blocks_per_chunk, block_size, chunk_tokens
         )
-        total_chunks = len(chunks)
-
-        for i in range(0, total_chunks, MAX_OBJECTS):
-            # Slice objects and block IDs for this batch
-            batch_objs_ptrs = objs_arg[i : i + MAX_OBJECTS]
-
-            start_block = i * req_blocks_per_obj
-            end_block = min(
-                (i + MAX_OBJECTS) * req_blocks_per_obj, len(selected_block_ids)
-            )
-            batch_blocks = block_ids_arg[start_block:end_block]
-
-            # Execute transfer for this batch
+        plan = build_object_group_transfer_plan(
+            geometry,
+            present=[True] * len(chunks),
+            batch_size=MAX_OBJECTS,
+            skip_first_n_tokens=skip_first_n_tokens,
+            is_h2d=True,
+        )
+        for step in plan:
+            batch_objs_ptrs = [objs_arg[k] for k in step.object_indices]
+            launch = step.launches[0]
+            batch_blocks = block_ids_arg[
+                launch.start_block_pos : launch.start_block_pos + launch.num_blocks
+            ]
             lmc_ops.multi_layer_block_kv_transfer(
                 paged_arg,
                 batch_objs_ptrs,
@@ -758,7 +799,7 @@ def scatter_cpu_to_paged_kv(
                 shape_desc,
                 chunk_tokens,
                 engine_kv_format,
-                skip_prefix_n_blocks if i == 0 else 0,
+                launch.skip_blocks,
             )
     # Fast path: The async GPU copy might still be in progress.
     # We intentionally omit synchronization here for performance.
