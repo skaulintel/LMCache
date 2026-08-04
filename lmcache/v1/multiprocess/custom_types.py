@@ -130,12 +130,18 @@ class GroupLayout(msgspec.Struct):
         tokens_per_block: Tokens covered by one paged block of this group
             (``EngineGroupInfo.tokens_per_block``; falls back to the engine
             ``block_size`` when the engine reported ``0``).
+        window_tokens: Tokens stored per LMCache chunk for this group. Equals
+            the full chunk token count for full-attention groups; for a
+            sliding-window group it is ``min(chunk_tokens, sw_size_tokens)`` so
+            the server sizes each per-chunk object to the window. ``0`` means
+            "full chunk" (legacy workers that predate SW support).
     """
 
     num_layers: int
     hidden_dim_size: int
     dtype_str: str
     tokens_per_block: int
+    window_tokens: int = 0
 
 
 class RegisterEngineDrivenContextPayload(msgspec.Struct):

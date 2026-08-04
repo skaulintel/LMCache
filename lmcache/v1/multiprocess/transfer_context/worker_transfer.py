@@ -192,12 +192,18 @@ class _GroupState:
         engine_kv_format: Detected KV format for this group's tensors.
         blocks_in_chunk: Paged blocks of THIS group per LMCache chunk
             (``chunk_tokens / tokens_per_block``).
+        blocks_per_window: Paged blocks of THIS group actually stored per
+            chunk. Equals ``blocks_in_chunk`` for full-attention groups; for a
+            sliding-window group it is ``window_tokens / tokens_per_block``, so
+            only the trailing ``blocks_per_window`` blocks of each chunk are
+            gathered / scattered.
         layout_desc: Chunk layout for this group's objects.
     """
 
     layer_names: list[str]
     engine_kv_format: "lmc_ops.EngineKVFormat"
     blocks_in_chunk: int
+    blocks_per_window: int
     layout_desc: MemoryLayoutDesc
 
 
@@ -734,14 +740,6 @@ class EngineDrivenTransferContext(TransferContext):
         if len(engine_group_infos) > 1:
             layer_names = list(kv_caches)
             for gid, group in enumerate(engine_group_infos):
-                if group.sw_size_tokens >= 0:
-                    raise RuntimeError(
-                        "engine-driven multi-group transfer only supports "
-                        "uniform-coverage groups; group "
-                        f"{gid} is sliding-window "
-                        f"(sw_size_tokens={group.sw_size_tokens}). Run with "
-                        "a unified KV cache manager instead."
-                    )
                 subset = {
                     layer_names[i]: kv_caches[layer_names[i]]
                     for i in group.layer_indices
@@ -760,11 +758,24 @@ class EngineDrivenTransferContext(TransferContext):
                         f"group {gid} tokens_per_block={tokens_per_block} does "
                         f"not divide the chunk size ({chunk_tokens} tokens)"
                     )
+                # Sliding-window groups store only the trailing window of each
+                # chunk. sw_size_tokens < 0 (or >= chunk) means full attention:
+                # window == chunk, so blocks_per_window == blocks_in_chunk and
+                # everything below collapses to the full-coverage behaviour.
+                sw = group.sw_size_tokens
+                window_tokens = chunk_tokens if sw < 0 or sw >= chunk_tokens else sw
+                if window_tokens % tokens_per_block != 0:
+                    raise RuntimeError(
+                        f"group {gid} sliding-window size ({window_tokens} "
+                        f"tokens) is not a multiple of tokens_per_block "
+                        f"({tokens_per_block})"
+                    )
+                blocks_per_window = window_tokens // tokens_per_block
                 g_mla = g_kv_size == 1
                 g_shape = (
-                    torch.Size([g_num_layers, chunk_tokens, g_hidden])
+                    torch.Size([g_num_layers, window_tokens, g_hidden])
                     if g_mla
-                    else torch.Size([2, g_num_layers, chunk_tokens, g_hidden])
+                    else torch.Size([2, g_num_layers, window_tokens, g_hidden])
                 )
                 group_layouts.append(
                     GroupLayout(
@@ -772,6 +783,7 @@ class EngineDrivenTransferContext(TransferContext):
                         hidden_dim_size=g_hidden,
                         dtype_str=g_dtype_str,
                         tokens_per_block=tokens_per_block,
+                        window_tokens=window_tokens,
                     )
                 )
                 group_states.append(
@@ -779,6 +791,7 @@ class EngineDrivenTransferContext(TransferContext):
                         layer_names=[layer_names[i] for i in group.layer_indices],
                         engine_kv_format=g_format,
                         blocks_in_chunk=chunk_tokens // tokens_per_block,
+                        blocks_per_window=blocks_per_window,
                         layout_desc=MemoryLayoutDesc(
                             shapes=[g_shape],
                             dtypes=[getattr(torch, g_dtype_str)],
@@ -995,6 +1008,7 @@ class EngineDrivenTransferContext(TransferContext):
                 engine_kv_format=state.engine_kv_format,
                 out=out_g,
                 chunk_indices=chunks_g,
+                blocks_per_window=state.blocks_per_window,
             )
         # SHM writes are async device->CPU copies; complete them before commit.
         torch_dev.synchronize()
@@ -1034,6 +1048,7 @@ class EngineDrivenTransferContext(TransferContext):
                         skip_first_n_tokens=skip_first_n_tokens,
                         layout_hints=self._layout_hints,
                         engine_kv_format=state.engine_kv_format,
+                        blocks_per_window=state.blocks_per_window,
                     )
             except (RuntimeError, ValueError, TypeError, IndexError):
                 logger.exception("Failed to scatter retrieved CPU context chunks")

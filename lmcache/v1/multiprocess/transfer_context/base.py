@@ -36,6 +36,7 @@ from lmcache.v1.multiprocess.mq import MessageQueueClient
 from lmcache.v1.multiprocess.transfer_plan import (
     KernelGroupGeometry,
     ObjectGroupGeometry,
+    _recalculate_blocks_to_skip,
     build_object_group_transfer_plan,
 )
 
@@ -350,16 +351,21 @@ def compute_kv_layout(
     )
 
 
-def _uniform_object_group_geometry(
+def _object_group_geometry(
     blocks_per_chunk: int,
+    blocks_per_window: int,
     block_size: int,
     tokens_per_chunk: int,
 ) -> ObjectGroupGeometry:
     """Geometry for the engine-driven path's single native gather/scatter.
 
     One ``multi_layer_block_kv_transfer`` covers every layer of one LMCache
-    group in a single call, so the object group has exactly one kernel group
-    with full-attention coverage (window == chunk) and no sliding window.
+    group in a single call, so the object group has exactly one kernel group.
+    ``blocks_per_window == blocks_per_chunk`` for full attention; a sliding-
+    window group passes a smaller window so the planner keeps only the trailing
+    blocks of each chunk. Object-level skipping stays off (``num_chunks_in_sw
+    == -1``): the SW reduction is purely within each chunk, matching the
+    lmcache-driven ``downsample_and_stage_block_ids``.
     """
     return ObjectGroupGeometry(
         object_group_id=0,
@@ -367,7 +373,7 @@ def _uniform_object_group_geometry(
             KernelGroupGeometry(
                 kernel_group_id=0,
                 blocks_per_chunk=blocks_per_chunk,
-                blocks_per_window=blocks_per_chunk,
+                blocks_per_window=blocks_per_window,
                 tokens_to_blocks=lambda tokens: tokens // block_size,
             ),
         ),
@@ -384,6 +390,7 @@ def gather_paged_kv_to_cpu(
     engine_kv_format: "lmc_ops.EngineKVFormat" | None = None,
     out: list[torch.Tensor] | None = None,
     chunk_indices: list[int] | None = None,
+    blocks_per_window: int | None = None,
 ) -> list[torch.Tensor]:
     """Gather paged KV blocks into CPU chunk tensors.
 
@@ -443,6 +450,11 @@ def gather_paged_kv_to_cpu(
     num_blocks = get_num_blocks(normalized, engine_kv_format)
     num_chunks = len(block_ids) // blocks_per_chunk
     chunk_tokens = blocks_per_chunk * block_size
+    # Sliding-window groups store only the trailing window of each chunk; for
+    # full attention bpw == blocks_per_chunk so window_tokens == chunk_tokens
+    # and every branch below collapses to the full-coverage behaviour.
+    bpw = blocks_per_chunk if blocks_per_window is None else blocks_per_window
+    window_tokens = bpw * block_size
 
     shape_desc = make_page_buffer_shape_desc(
         normalized,
@@ -527,9 +539,12 @@ def gather_paged_kv_to_cpu(
 
     selected_block_ids: list[int] = []
     for chunk_idx in iter_indices:
-        selected_block_ids.extend(
-            block_ids[chunk_idx * blocks_per_chunk : (chunk_idx + 1) * blocks_per_chunk]
-        )
+        chunk = block_ids[
+            chunk_idx * blocks_per_chunk : (chunk_idx + 1) * blocks_per_chunk
+        ]
+        # Keep only the trailing window blocks of the chunk (whole chunk when
+        # bpw == blocks_per_chunk), matching downsample_and_stage_block_ids.
+        selected_block_ids.extend(chunk[-bpw:])
 
     if selected_block_ids:
         if _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR:
@@ -546,7 +561,7 @@ def gather_paged_kv_to_cpu(
                 tensors[0].device,
                 lmc_ops.TransferDirection.D2H,
                 shape_desc,
-                chunk_tokens,
+                window_tokens,
                 engine_kv_format,
                 0,
             )
@@ -573,8 +588,8 @@ def gather_paged_kv_to_cpu(
             # writes every gathered chunk, so skip_first_n_tokens is 0 and no
             # block is skipped.
             MAX_OBJECTS = 4
-            geometry = _uniform_object_group_geometry(
-                blocks_per_chunk, block_size, chunk_tokens
+            geometry = _object_group_geometry(
+                blocks_per_chunk, bpw, block_size, chunk_tokens
             )
             plan = build_object_group_transfer_plan(
                 geometry,
@@ -596,7 +611,7 @@ def gather_paged_kv_to_cpu(
                     tensors[0].device,
                     lmc_ops.TransferDirection.D2H,
                     shape_desc,
-                    chunk_tokens,
+                    window_tokens,
                     engine_kv_format,
                     launch.skip_blocks,
                 )
@@ -635,6 +650,7 @@ def scatter_cpu_to_paged_kv(
     skip_first_n_tokens: int = 0,
     layout_hints: LayoutHints | None = None,
     engine_kv_format: "lmc_ops.EngineKVFormat" | None = None,
+    blocks_per_window: int | None = None,
 ) -> None:
     """Scatter CPU chunk tensors back into paged KV tensors.
 
@@ -690,6 +706,8 @@ def scatter_cpu_to_paged_kv(
     num_layers = get_num_layers(normalized, engine_kv_format)
     num_blocks = get_num_blocks(normalized, engine_kv_format)
     chunk_tokens = blocks_per_chunk * block_size
+    bpw = blocks_per_chunk if blocks_per_window is None else blocks_per_window
+    window_tokens = bpw * block_size
 
     # Block-level transfer can only skip whole blocks. A non-aligned prefix is
     # rounded down to the nearest block (matching the lmcache-driven path in
@@ -704,6 +722,14 @@ def scatter_cpu_to_paged_kv(
             skip_first_n_tokens // block_size,
         )
     skip_prefix_n_blocks = skip_first_n_tokens // block_size
+    # For a sliding-window group the leading blocks of each chunk were dropped
+    # by the trailing-keep, so an APC skip-prefix expressed in full-chunk blocks
+    # must be re-expressed in window blocks. No-op when window == chunk. (The
+    # planner already does this for the compiled/plan branch; this covers the
+    # single-shot Python-fallback branch below.)
+    skip_prefix_window = _recalculate_blocks_to_skip(
+        blocks_per_chunk, bpw, skip_prefix_n_blocks
+    )
 
     shape_desc = make_page_buffer_shape_desc(
         normalized,
@@ -716,9 +742,11 @@ def scatter_cpu_to_paged_kv(
 
     selected_block_ids: list[int] = []
     for chunk_idx in range(len(chunks)):
-        selected_block_ids.extend(
-            block_ids[chunk_idx * blocks_per_chunk : (chunk_idx + 1) * blocks_per_chunk]
-        )
+        chunk = block_ids[
+            chunk_idx * blocks_per_chunk : (chunk_idx + 1) * blocks_per_chunk
+        ]
+        # Trailing window blocks only (whole chunk when bpw == blocks_per_chunk).
+        selected_block_ids.extend(chunk[-bpw:])
 
     if not selected_block_ids:
         return
@@ -736,9 +764,9 @@ def scatter_cpu_to_paged_kv(
             tensors[0].device,
             lmc_ops.TransferDirection.H2D,
             shape_desc,
-            chunk_tokens,
+            window_tokens,
             engine_kv_format,
-            skip_prefix_n_blocks,
+            skip_prefix_window,
         )
     else:
         # assuming this is c ops path which requires pin memory
@@ -774,8 +802,8 @@ def scatter_cpu_to_paged_kv(
         # on the straddling batch, so a skip spanning more than one batch is
         # honored per batch (the earlier code skipped only the first batch).
         MAX_OBJECTS = 4
-        geometry = _uniform_object_group_geometry(
-            blocks_per_chunk, block_size, chunk_tokens
+        geometry = _object_group_geometry(
+            blocks_per_chunk, bpw, block_size, chunk_tokens
         )
         plan = build_object_group_transfer_plan(
             geometry,
@@ -797,7 +825,7 @@ def scatter_cpu_to_paged_kv(
                 tensors[0].device,
                 lmc_ops.TransferDirection.H2D,
                 shape_desc,
-                chunk_tokens,
+                window_tokens,
                 engine_kv_format,
                 launch.skip_blocks,
             )

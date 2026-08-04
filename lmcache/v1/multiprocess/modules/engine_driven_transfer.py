@@ -379,14 +379,14 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                         f"Invalid group dtype_str '{gl.dtype_str}' in "
                         "engine-driven registration"
                     )
+                # Sliding-window groups store a reduced token window per chunk;
+                # size the per-chunk object to that window (fall back to the full
+                # chunk when the worker didn't report one, e.g. legacy payloads).
+                g_tokens = gl.window_tokens or self._ctx.chunk_size
                 g_shape = (
-                    torch.Size(
-                        [gl.num_layers, self._ctx.chunk_size, gl.hidden_dim_size]
-                    )
+                    torch.Size([gl.num_layers, g_tokens, gl.hidden_dim_size])
                     if payload.use_mla
-                    else torch.Size(
-                        [2, gl.num_layers, self._ctx.chunk_size, gl.hidden_dim_size]
-                    )
+                    else torch.Size([2, gl.num_layers, g_tokens, gl.hidden_dim_size])
                 )
                 group_layouts.append(
                     MemoryLayoutDesc(shapes=[g_shape], dtypes=[g_dtype])

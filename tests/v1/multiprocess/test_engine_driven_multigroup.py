@@ -197,12 +197,14 @@ def _fanout_ctx(monkeypatch) -> tuple[EngineDrivenTransferContext, list[dict]]:
             layer_names=["layer_0", "layer_1"],
             engine_kv_format=MagicMock(),
             blocks_in_chunk=2,
+            blocks_per_window=1,  # sliding-window group: keeps 1 of 2 blocks/chunk
             layout_desc=MagicMock(),
         ),
         worker_transfer._GroupState(
             layer_names=["layer_2"],
             engine_kv_format=MagicMock(),
             blocks_in_chunk=1,
+            blocks_per_window=1,  # full attention (window == chunk)
             layout_desc=MagicMock(),
         ),
     ]
@@ -214,6 +216,7 @@ def _fanout_ctx(monkeypatch) -> tuple[EngineDrivenTransferContext, list[dict]]:
                 "layers": sorted(kv_caches),
                 "block_ids": block_ids,
                 "blocks_in_chunk": blocks_in_chunk,
+                "blocks_per_window": kwargs.get("blocks_per_window"),
                 "out": kwargs.get("out"),
                 "chunk_indices": kwargs.get("chunk_indices"),
             }
@@ -242,13 +245,17 @@ def test_submit_store_multigroup_fans_out_per_group(monkeypatch) -> None:
     assert fake.committed
     assert len(calls) == 2
     assert calls[0]["layers"] == ["layer_0", "layer_1"]
+    # Raw (full) per-group block list is passed through; the sliding-window
+    # trailing-keep happens inside gather, driven by blocks_per_window.
     assert calls[0]["block_ids"] == [1, 2, 3, 4]
     assert calls[0]["blocks_in_chunk"] == 2
+    assert calls[0]["blocks_per_window"] == 1
     assert calls[0]["out"] == [t[0], t[1]]
     assert calls[0]["chunk_indices"] == [0, 1]
     assert calls[1]["layers"] == ["layer_2"]
     assert calls[1]["block_ids"] == [5, 6]
     assert calls[1]["blocks_in_chunk"] == 1
+    assert calls[1]["blocks_per_window"] == 1
     assert calls[1]["out"] == [t[2], t[3]]
 
 
@@ -259,26 +266,51 @@ def test_submit_store_multigroup_group_count_mismatch(monkeypatch) -> None:
         ctx.submit_store("req", MagicMock(), 1, {}, [[1, 2]], MagicMock(), 2)
 
 
-def test_register_rejects_sliding_window_groups() -> None:
+def test_register_accepts_sliding_window_groups() -> None:
+    """A sliding-window group registers (window < chunk) instead of raising; the
+    SW group keeps fewer blocks per chunk than its full-attention sibling, and
+    the payload carries the reduced per-group window."""
     ctx = EngineDrivenTransferContext()
     kv = {f"layer_{i}": torch.zeros(2, 4, 4, 2, 8) for i in range(2)}
-    with pytest.raises(RuntimeError, match="sliding-window"):
-        ctx.register(
-            instance_id=1,
-            kv_caches=kv,
-            model_name="m",
-            world_size=1,
-            blocks_in_chunk=2,
-            mq_client=MagicMock(),
-            mq_timeout=1.0,
-            send_request=MagicMock(),
-            engine_group_infos=[
-                EngineGroupInfo(engine_group_id=0, layer_indices=(0,)),
-                EngineGroupInfo(
-                    engine_group_id=1, layer_indices=(1,), sw_size_tokens=128
-                ),
-            ],
+
+    # First Party
+    from lmcache.v1.multiprocess.protocols.engine import (
+        RegisterEngineDrivenContextResponse,
+    )
+
+    sent: list[Any] = []
+
+    def _send(_mq, _rt, args):
+        sent.append(args[0])
+        future = MagicMock()
+        future.result.return_value = RegisterEngineDrivenContextResponse(
+            shm_name="lmcache_l1_pool_x", pool_size=4096
         )
+        return future
+
+    ctx.register(
+        instance_id=1,
+        kv_caches=kv,
+        model_name="m",
+        world_size=1,
+        blocks_in_chunk=2,
+        mq_client=MagicMock(),
+        mq_timeout=1.0,
+        send_request=_send,
+        engine_group_infos=[
+            EngineGroupInfo(engine_group_id=0, layer_indices=(0,)),
+            EngineGroupInfo(engine_group_id=1, layer_indices=(1,), sw_size_tokens=4),
+        ],
+    )
+    # chunk_tokens = blocks_in_chunk(2) * block_size(4) = 8; group 1's 4-token
+    # window is 1 of 2 blocks per chunk. Group 0 (full attention) keeps both.
+    full, sw = ctx._group_states
+    assert full.blocks_per_window == full.blocks_in_chunk == 2
+    assert sw.blocks_in_chunk == 2
+    assert sw.blocks_per_window == 1
+    payload: RegisterEngineDrivenContextPayload = sent[0]
+    assert payload.group_layouts[0].window_tokens == 8  # full attention
+    assert payload.group_layouts[1].window_tokens == 4  # sliding window
 
 
 def test_register_payload_carries_group_layouts() -> None:
@@ -320,5 +352,9 @@ def test_register_payload_carries_group_layouts() -> None:
     assert payload.group_layouts[0].num_layers == 2
     assert payload.group_layouts[1].num_layers == 1
     assert isinstance(payload.group_layouts[0], GroupLayout)
+    # Full-attention groups carry the full chunk as their window
+    # (blocks_in_chunk 2 * block_size 4 = 8 tokens).
+    assert payload.group_layouts[0].window_tokens == 8
+    assert payload.group_layouts[1].window_tokens == 8
     assert len(ctx._group_states) == 2
     assert ctx._group_states[1].layer_names == ["layer_2"]
