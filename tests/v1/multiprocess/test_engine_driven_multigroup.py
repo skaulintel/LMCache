@@ -231,7 +231,7 @@ def test_submit_store_multigroup_fans_out_per_group(monkeypatch) -> None:
     ctx, calls = _fanout_ctx(monkeypatch)
     t = [torch.zeros(1) for _ in range(4)]
     fake = _FakeGroupedContext(t, [0, 1, 0, 1], [0, 0, 1, 1])
-    ctx._engine_driven_context = fake
+    ctx._engine_driven_context = fake  # type: ignore[assignment]
 
     kv = {name: torch.zeros(1) for name in ("layer_0", "layer_1", "layer_2")}
     future = ctx.submit_store(
@@ -254,7 +254,7 @@ def test_submit_store_multigroup_fans_out_per_group(monkeypatch) -> None:
 
 def test_submit_store_multigroup_group_count_mismatch(monkeypatch) -> None:
     ctx, _ = _fanout_ctx(monkeypatch)
-    ctx._engine_driven_context = _FakeGroupedContext([], [], [])
+    ctx._engine_driven_context = _FakeGroupedContext([], [], [])  # type: ignore[assignment]
     with pytest.raises(RuntimeError, match="block-id lists"):
         ctx.submit_store("req", MagicMock(), 1, {}, [[1, 2]], MagicMock(), 2)
 
