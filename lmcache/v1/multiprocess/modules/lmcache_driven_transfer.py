@@ -50,11 +50,6 @@ from lmcache.v1.multiprocess.transfer_plan import (
     KernelGroupGeometry,
     ObjectGroupGeometry,
     TransferPlanStep,
-)
-from lmcache.v1.multiprocess.transfer_plan import (
-    batched_iteration_with_skip as batched_iteration_with_skip,
-)
-from lmcache.v1.multiprocess.transfer_plan import (
     build_object_group_transfer_plan,
 )
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
@@ -279,8 +274,9 @@ def _run_object_group_transfer_plan(
     This is the native fast path invoked by
     :func:`transfer_kv_per_object_group` when the native
     ``execute_object_group_transfer`` op is available and no object is
-    GDS-backed. It consumes the same shared transfer plan as the per-launch
-    fallback in that function, but instead of issuing each staging copy and
+    GDS-backed. It consumes the same shared
+    :func:`build_object_group_transfer_plan` output as the per-launch fallback in
+    that function, but instead of issuing each staging copy and
     kernel launch immediately (each a GIL release/re-acquire), it resolves every
     plan step to plain pointers/scalars (GIL held throughout) and hands the whole
     batch to ``execute_object_group_transfer``, which issues all of it on the

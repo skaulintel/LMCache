@@ -15,6 +15,11 @@ from dataclasses import dataclass
 from itertools import islice
 from typing import Callable, Generator, Sequence
 
+# First Party
+from lmcache.logging import init_logger
+
+logger = init_logger(__name__)
+
 __all__ = [
     "KernelGroupGeometry",
     "ObjectGroupGeometry",
@@ -217,6 +222,14 @@ def build_object_group_transfer_plan(
     num_objects_to_skip = 0
     if geometry.num_chunks_in_sw >= 0 and is_h2d:
         num_objects_to_skip = max(0, num_objects - geometry.num_chunks_in_sw)
+        if num_objects_to_skip > 0:
+            logger.debug(
+                "Sliding window: skipping the first %d of %d leading objects "
+                "(H2D, window covers %d trailing chunks)",
+                num_objects_to_skip,
+                num_objects,
+                geometry.num_chunks_in_sw,
+            )
 
     tokens_per_chunk = geometry.tokens_per_chunk
     steps: list[TransferPlanStep] = []
