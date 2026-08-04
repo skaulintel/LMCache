@@ -1149,6 +1149,48 @@ def test_server_register_and_find_non_cuda_context_layout(
     assert layout.shapes[0] == torch.Size([2, 2, 16, 16])
 
 
+def test_register_multigroup_sizes_object_group_count(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """A hybrid-KV registration must size the layout registry to
+    ``len(group_layouts)`` object groups. The lookup/prefetch path fans out over
+    the registered AttnWindowDesc's group count, while store/retrieve fan out
+    over the worker's groups; if the desc keeps its single-group default, every
+    group past 0 is never prefetched and misses at retrieve."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import (
+        GroupLayout,
+        RegisterEngineDrivenContextPayload,
+    )
+
+    module, _, _, ctx = server_module_factory(chunk_size=16)
+    group = GroupLayout(
+        num_layers=1,
+        hidden_dim_size=16,
+        dtype_str="float32",
+        tokens_per_block=4,
+    )
+    module.register_kv_cache_engine_driven_context(
+        RegisterEngineDrivenContextPayload(
+            instance_id=1,
+            model_name="m",
+            world_size=1,
+            block_size=4,
+            num_layers=2,
+            hidden_dim_size=16,
+            dtype_str="float32",
+            use_mla=False,
+            group_layouts=[group, group],
+        )
+    )
+
+    assert ctx.layout_desc_registry.find_attn_desc("m", 1).num_object_groups == 2
+    group_descs = ctx.layout_desc_registry.find_group_layout_descs("m", 1)
+    assert group_descs is not None
+    assert set(group_descs) == {0, 1}
+
+
 def test_server_store_and_retrieve_cpu_chunks(
     stub_native_storage_ops: Any,
     server_module_factory: ServerModuleFactory,

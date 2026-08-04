@@ -13,6 +13,7 @@ import torch
 from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.distributed.api import (
+    AttnWindowDesc,
     MemoryLayoutDesc,
     ObjectKey,
 )
@@ -427,9 +428,31 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             payload.world_size,
         )
 
-        self._ctx.layout_desc_registry.register(
-            payload.model_name, payload.world_size, layout_desc
-        )
+        if group_layouts:
+            # The lookup/prefetch path fans its object-group lookups out over
+            # the registered AttnWindowDesc's group count. A hybrid-KV worker
+            # stores and retrieves ``len(group_layouts)`` object groups, but the
+            # default single-group desc makes lookup prefetch only group 0 --
+            # every later group then misses at retrieve (unsafe_read finds no
+            # read-locked objects) and vLLM consumes the unloaded blocks. Match
+            # the desc's group count to the worker's. Engine-driven storage is
+            # uniform-coverage (every chunk of every group is stored), so each
+            # group is registered full-attention.
+            attn_desc = AttnWindowDesc(
+                num_chunks_in_sw=[-1] * len(group_layouts),
+                world_size=payload.world_size,
+            )
+            self._ctx.layout_desc_registry.register(
+                payload.model_name,
+                payload.world_size,
+                layout_desc,
+                attn_desc=attn_desc,
+                group_layout_descs=dict(enumerate(group_layouts)),
+            )
+        else:
+            self._ctx.layout_desc_registry.register(
+                payload.model_name, payload.world_size, layout_desc
+            )
         return RegisterEngineDrivenContextResponse(
             shm_name=shm_name, pool_size=pool_size
         )
