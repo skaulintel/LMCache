@@ -200,35 +200,18 @@ steps:
         plugins: [{ kubernetes: { podSpec: *pod-1gpu } }]
         artifact_paths: ["*.log"]
 
-      # Engine-driven HMA verifies both transport backends end-to-end. Both
-      # matrix entries use the dshm pod: pickle remains lazy and ignores the
-      # mount, while SHM disables lazy L1 allocation and maps the pool.
-      - label: ":electric_plug: hma_lm_eval_gemma4_engine_driven / {{matrix.transport}}"
+      # Engine-driven HMA on the hybrid gemma-4 (its KV cache groups take
+      # different block sizes, i.e. multi-group). Engine-driven multi-group
+      # transfer requires the SHM transport -- both the worker registration
+      # (worker_transfer) and the server pickle strategy (server_transfer)
+      # reject multi-group over pickle -- so this runs SHM only, with the
+      # non-lazy L1 pool mapped from the dshm mount.
+      - label: ":electric_plug: hma_lm_eval_gemma4_engine_driven / shm"
         command: |
           export LMCACHE_MP_TRANSFER_MODE="engine_driven"
-          export ENGINE_DRIVEN_TRANSPORT="{{matrix.transport}}"
-          case "{{matrix.transport}}" in
-            pickle)
-              export L1_USE_LAZY="true"
-              # Pickle sends complete hybrid KV payloads through one MQ
-              # connection. Limit this correctness-only job's request
-              # concurrency so queued payloads do not exhaust the RPC budget;
-              # the SHM matrix entry retains the regular 50-way stress load.
-              export NUM_CONCURRENT="4"
-              export LIMIT="30"
-              export STORE_DRAIN_SECONDS="180"
-              export LMCACHE_MQ_TIMEOUT="300"
-              ;;
-            shm)
-              export L1_USE_LAZY="false"
-              ;;
-          esac
+          export ENGINE_DRIVEN_TRANSPORT="shm"
+          export L1_USE_LAZY="false"
           .buildkite/k3_tests/multiprocess/run.sh hma_lm_eval_gemma4_engine_driven
-        matrix:
-          setup:
-            transport:
-              - "pickle"
-              - "shm"
         timeout_in_minutes: 60
         retry: *flaky-retry
         env:
