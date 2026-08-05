@@ -534,6 +534,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             cpu_data=cpu_data,
             context=entry.metadata,
             resolve_obj_keys=self._resolve_single_group_obj_keys,
+            group_keys=self._group_keys_for(entry, key),
         )
         if st is not None and result:
             num_tokens = (

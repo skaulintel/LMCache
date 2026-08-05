@@ -116,6 +116,7 @@ class TransferStrategy(abc.ABC):
         cpu_data: bytes,
         context: EngineDrivenContextMetadata,
         resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
+        group_keys: "list[list[ObjectKey]] | None" = None,
     ) -> bool:
         """Finalize a store request.
 
@@ -125,6 +126,8 @@ class TransferStrategy(abc.ABC):
             cpu_data: Serialized payload from the worker.
             context: Non-GPU transfer metadata for the instance.
             resolve_obj_keys: Callable that resolves object keys from ``key``.
+            group_keys: Group-major object keys for multi-group workers;
+                ``None`` for single-group.
 
         Returns:
             ``True`` when the strategy successfully commits the store request.
@@ -198,31 +201,24 @@ class PickleTransferStrategy(TransferStrategy):
     ) -> PrepareStoreResponse:
         """Return empty store context for pickle mode.
 
-        Pickle transport does not pre-allocate SHM slots during prepare.
+        Pickle transport does not pre-allocate SHM slots during prepare; the
+        whole (single- or multi-group) payload arrives with ``commit_store``.
         """
-        if group_keys is not None and len(group_keys) > 1:
-            raise RuntimeError(
-                "pickle transport does not support multi-group transfers"
-            )
         return PrepareStoreResponse(context={})
 
-    def commit_store(
+    def _write_chunks(
         self,
-        key: IPCCacheServerKey,
-        instance_id: int,
-        cpu_data: bytes,
-        context: EngineDrivenContextMetadata,
-        resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
-    ) -> bool:
-        """Deserialize and write pickled chunks into reserved objects.
+        obj_keys: list[ObjectKey],
+        chunks: list[torch.Tensor],
+        layout_desc: Any,
+    ) -> tuple[int, int]:
+        """Reserve ``obj_keys`` and copy matching ``chunks`` into them.
 
         Returns:
-            ``True`` when every reserved object is written successfully.
+            ``(written, reserved)`` counts for the group.
         """
-        obj_keys = resolve_obj_keys(key)
-        chunks: list[torch.Tensor] = pickle.loads(cpu_data)
         reserved_dict = self._storage_manager.reserve_write(
-            obj_keys, context.layout_desc, "new"
+            obj_keys, layout_desc, "new"
         )
         written_keys: list[ObjectKey] = []
         try:
@@ -242,8 +238,50 @@ class PickleTransferStrategy(TransferStrategy):
         finally:
             if written_keys:
                 self._storage_manager.finish_write(written_keys)
+        return len(written_keys), len(reserved_dict)
 
-        return len(written_keys) == len(reserved_dict)
+    def commit_store(
+        self,
+        key: IPCCacheServerKey,
+        instance_id: int,
+        cpu_data: bytes,
+        context: EngineDrivenContextMetadata,
+        resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
+        group_keys: "list[list[ObjectKey]] | None" = None,
+    ) -> bool:
+        """Deserialize and write pickled chunks into reserved objects.
+
+        Single-group payloads are a flat chunk list; multi-group payloads are
+        group-major (``chunks[group][chunk]``) and each group is written
+        against its own layout from ``context.group_layouts``.
+
+        Returns:
+            ``True`` when every reserved object is written successfully.
+        """
+        if group_keys is not None and len(group_keys) > 1:
+            group_chunks: list[list[torch.Tensor]] = pickle.loads(cpu_data)
+            group_layouts = context.group_layouts
+            if group_layouts is None or len(group_chunks) != len(group_keys):
+                logger.error(
+                    "multi-group pickle store payload has %d groups but "
+                    "%d are registered",
+                    len(group_chunks),
+                    len(group_keys),
+                )
+                return False
+            ok = True
+            for g_keys, g_chunks, g_layout in zip(
+                group_keys, group_chunks, group_layouts, strict=True
+            ):
+                written, reserved = self._write_chunks(g_keys, g_chunks, g_layout)
+                ok = ok and written == reserved
+            return ok
+
+        chunks: list[torch.Tensor] = pickle.loads(cpu_data)
+        written, reserved = self._write_chunks(
+            resolve_obj_keys(key), chunks, context.layout_desc
+        )
+        return written == reserved
 
     def prepare_retrieve(
         self,
@@ -252,32 +290,44 @@ class PickleTransferStrategy(TransferStrategy):
         resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
         group_keys: "list[list[ObjectKey]] | None" = None,
     ) -> PrepareRetrieveResponse:
-        """Read prefetched objects and return serialized pickle payload."""
-        if group_keys is not None and len(group_keys) > 1:
-            raise RuntimeError(
-                "pickle transport does not support multi-group transfers"
-            )
-        obj_keys = resolve_obj_keys(key)
-        prefetched_keys: list[ObjectKey] = []
-        try:
-            read_ctx = self._storage_manager.read_prefetched_results(obj_keys)
-            with read_ctx as maybe_memory_objs:
-                if not maybe_memory_objs or len(maybe_memory_objs) != len(obj_keys):
-                    return PrepareRetrieveResponse(success=False, data=b"", context={})
-                prefetched_keys = obj_keys[: len(maybe_memory_objs)]
-                chunks = []
-                for memory_obj in maybe_memory_objs:
-                    if memory_obj.tensor is None:
+        """Read prefetched objects and return a serialized pickle payload.
+
+        Single-group responses carry a flat chunk list. Multi-group responses
+        carry a group-major ``chunks[group][chunk]`` list and are
+        all-or-nothing: a retrieve is a miss unless EVERY group has every
+        chunk.
+        """
+        multi_group = group_keys is not None and len(group_keys) > 1
+        if group_keys is None:
+            group_keys = [resolve_obj_keys(key)]
+
+        group_chunks: list[list[torch.Tensor]] = []
+        for g_keys in group_keys:
+            prefetched_keys: list[ObjectKey] = []
+            try:
+                read_ctx = self._storage_manager.read_prefetched_results(g_keys)
+                with read_ctx as maybe_memory_objs:
+                    if not maybe_memory_objs or len(maybe_memory_objs) != len(g_keys):
                         return PrepareRetrieveResponse(
                             success=False, data=b"", context={}
                         )
-                    chunks.append(memory_obj.tensor.cpu().clone())
-                return PrepareRetrieveResponse(
-                    success=True, data=pickle.dumps(chunks), context={}
-                )
-        finally:
-            if prefetched_keys:
-                self._storage_manager.finish_read_prefetched(prefetched_keys)
+                    prefetched_keys = g_keys[: len(maybe_memory_objs)]
+                    chunks: list[torch.Tensor] = []
+                    for memory_obj in maybe_memory_objs:
+                        if memory_obj.tensor is None:
+                            return PrepareRetrieveResponse(
+                                success=False, data=b"", context={}
+                            )
+                        chunks.append(memory_obj.tensor.cpu().clone())
+                    group_chunks.append(chunks)
+            finally:
+                if prefetched_keys:
+                    self._storage_manager.finish_read_prefetched(prefetched_keys)
+
+        payload: Any = group_chunks if multi_group else group_chunks[0]
+        return PrepareRetrieveResponse(
+            success=True, data=pickle.dumps(payload), context={}
+        )
 
     def commit_retrieve(
         self,
@@ -406,6 +456,7 @@ class ShmTransferStrategy(TransferStrategy):
         cpu_data: bytes,
         context: EngineDrivenContextMetadata,
         resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
+        group_keys: "list[list[ObjectKey]] | None" = None,
     ) -> bool:
         """Finalize SHM store write locks or fallback to pickle commit.
 
@@ -419,6 +470,7 @@ class ShmTransferStrategy(TransferStrategy):
                 cpu_data=cpu_data,
                 context=context,
                 resolve_obj_keys=resolve_obj_keys,
+                group_keys=group_keys,
             )
         transfer_key = self._transfer_key_factory(key, instance_id)
         with self._pending_lock:

@@ -4,8 +4,10 @@ Tests for engine-driven multi-group (uniform coverage) transfers.
 """
 
 # Standard
+from contextlib import contextmanager
 from typing import Any
 from unittest.mock import MagicMock
+import pickle as _pickle
 
 # Third Party
 import pytest
@@ -19,8 +21,10 @@ from lmcache.v1.multiprocess.custom_types import (
     RegisterEngineDrivenContextPayload,
 )
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+from lmcache.v1.multiprocess.modules.server_transfer import PickleTransferStrategy
 from lmcache.v1.multiprocess.transfer_context import worker_transfer
 from lmcache.v1.multiprocess.transfer_context.base import EngineDrivenContextMetadata
+from lmcache.v1.multiprocess.transfer_context.pickle import EngineDrivenContextPickle
 from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
     EngineDrivenTransferContext,
 )
@@ -311,6 +315,182 @@ def test_register_accepts_sliding_window_groups() -> None:
     payload: RegisterEngineDrivenContextPayload = sent[0]
     assert payload.group_layouts[0].window_tokens == 8  # full attention
     assert payload.group_layouts[1].window_tokens == 4  # sliding window
+
+
+def _pickle_worker_ctx(monkeypatch):
+    """Worker context with two groups over a real pickle transfer context."""
+    ctx, calls = _fanout_ctx(monkeypatch)
+    pctx = EngineDrivenContextPickle(
+        metadata=MagicMock(), mq_client=MagicMock(), mq_timeout=0.1
+    )
+    ctx._engine_driven_context = pctx
+    return ctx, pctx, calls
+
+
+def test_submit_store_multigroup_pickle_sends_group_major_payload(
+    monkeypatch,
+) -> None:
+    """Pickle store gathers each group into fresh CPU chunks (no slots) and
+    commits one group-major payload."""
+    ctx, pctx, _ = _pickle_worker_ctx(monkeypatch)
+    gathered = [["g0c0", "g0c1"], ["g1c0"]]
+    calls: list[dict] = []
+
+    def _fake_gather(*_a: Any, **kwargs: Any):
+        idx = len(calls)
+        calls.append(kwargs)
+        return gathered[idx]
+
+    monkeypatch.setattr(worker_transfer, "gather_paged_kv_to_cpu", _fake_gather)
+    monkeypatch.setattr(pctx, "prepare_store", lambda _k, _i: None)
+    committed: dict[str, Any] = {}
+
+    def _fake_commit(_k: Any, _i: int, chunks: Any) -> bool:
+        committed["chunks"] = chunks
+        return True
+
+    monkeypatch.setattr(pctx, "commit_store", _fake_commit)
+
+    kv = {name: torch.zeros(1) for name in ("layer_0", "layer_1", "layer_2")}
+    future = ctx.submit_store(
+        "req", MagicMock(), 1, kv, [[1, 2, 3, 4], [5, 6]], MagicMock(), 2
+    )
+
+    assert future.result(timeout=1) is True
+    assert committed["chunks"] == gathered
+    # Fresh CPU gathers: no slot tensors, no chunk-index filtering.
+    assert all(c.get("out") is None and c.get("chunk_indices") is None for c in calls)
+
+
+def test_submit_retrieve_multigroup_pickle_scatters_group_major(
+    monkeypatch,
+) -> None:
+    ctx, pctx, _ = _pickle_worker_ctx(monkeypatch)
+    payload = [[torch.ones(1)], [torch.ones(1) * 2]]
+    monkeypatch.setattr(pctx, "prepare_retrieve_multigroup", lambda _k, _i: payload)
+    scattered: list[dict] = []
+    monkeypatch.setattr(
+        worker_transfer,
+        "scatter_cpu_to_paged_kv",
+        lambda kv_caches, block_ids, chunks, *a, **k: scattered.append(
+            {"layers": sorted(kv_caches), "chunks": chunks}
+        ),
+    )
+
+    kv = {name: torch.zeros(1) for name in ("layer_0", "layer_1", "layer_2")}
+    future = ctx.submit_retrieve(
+        "req", MagicMock(), 1, kv, [[1, 2], [3]], MagicMock(), 2
+    )
+
+    assert future.result(timeout=1) is True
+    assert [s["layers"] for s in scattered] == [["layer_0", "layer_1"], ["layer_2"]]
+    assert scattered[0]["chunks"] is payload[0]
+    assert scattered[1]["chunks"] is payload[1]
+
+
+def test_submit_retrieve_multigroup_pickle_group_count_mismatch(
+    monkeypatch,
+) -> None:
+    """A payload whose group count differs from the registration is a miss."""
+    ctx, pctx, _ = _pickle_worker_ctx(monkeypatch)
+    monkeypatch.setattr(
+        pctx, "prepare_retrieve_multigroup", lambda _k, _i: [[torch.ones(1)]]
+    )
+    kv = {name: torch.zeros(1) for name in ("layer_0", "layer_1", "layer_2")}
+    future = ctx.submit_retrieve(
+        "req", MagicMock(), 1, kv, [[1, 2], [3]], MagicMock(), 2
+    )
+    assert future.result(timeout=1) is False
+
+
+class _FakeMemoryObj:
+    def __init__(self, shape):
+        self.tensor = torch.zeros(shape)
+
+
+class _FakeStorageManager:
+    """In-memory reserve/read double for the pickle strategy."""
+
+    def __init__(self, shapes_by_group: dict[int, tuple[int, ...]]):
+        self._shapes = shapes_by_group
+        self.objs: dict[ObjectKey, _FakeMemoryObj] = {}
+        self.finished_writes: list[ObjectKey] = []
+        self.finished_reads: list[ObjectKey] = []
+
+    def reserve_write(self, obj_keys, _layout, _mode):
+        reserved = {}
+        for obj_key in obj_keys:
+            obj = _FakeMemoryObj(self._shapes[obj_key.object_group_id])
+            self.objs[obj_key] = obj
+            reserved[obj_key] = obj
+        return reserved
+
+    def finish_write(self, keys):
+        self.finished_writes.extend(keys)
+
+    @contextmanager
+    def read_prefetched_results(self, obj_keys):
+        objs = [self.objs[k] for k in obj_keys if k in self.objs]
+        yield objs if len(objs) == len(obj_keys) else []
+
+    def finish_read_prefetched(self, keys):
+        self.finished_reads.extend(keys)
+
+
+def test_pickle_strategy_multigroup_store_retrieve_roundtrip() -> None:
+    """Group-major pickle commit writes each group against its own layout;
+    retrieve returns a group-major payload and is all-or-nothing."""
+    shapes: dict[int, tuple[int, ...]] = {0: (2, 2, 8, 16), 1: (2, 1, 8, 4)}
+    sm = _FakeStorageManager(shapes)
+    strategy = PickleTransferStrategy(sm)  # type: ignore[arg-type]
+    metadata = _group_metadata()
+    key = IPCCacheServerKey.from_token_ids(
+        "m", 1, 0, [1] * 16, start=0, end=16, request_id="req-pkl"
+    )
+    group_keys = [
+        [_obj_key(1, 0), _obj_key(2, 0)],
+        [_obj_key(1, 1), _obj_key(2, 1)],
+    ]
+    payload = [
+        [torch.full(shapes[0], float(c)) for c in range(2)],
+        [torch.full(shapes[1], float(10 + c)) for c in range(2)],
+    ]
+
+    assert (
+        strategy.commit_store(
+            key=key,
+            instance_id=7,
+            cpu_data=_pickle.dumps(payload),
+            context=metadata,
+            resolve_obj_keys=lambda _k: group_keys[0],
+            group_keys=group_keys,
+        )
+        is True
+    )
+    assert len(sm.finished_writes) == 4
+    assert torch.equal(sm.objs[_obj_key(2, 1)].tensor, payload[1][1])
+
+    ret = strategy.prepare_retrieve(
+        key=key,
+        instance_id=7,
+        resolve_obj_keys=lambda _k: group_keys[0],
+        group_keys=group_keys,
+    )
+    assert ret.success is True
+    retrieved = _pickle.loads(ret.data)
+    assert len(retrieved) == 2
+    assert torch.equal(retrieved[0][1], payload[0][1])
+    assert len(sm.finished_reads) == 4
+
+    # A group with a missing chunk makes the whole retrieve a miss.
+    partial_keys = [group_keys[0], [_obj_key(1, 1), _obj_key(9, 1)]]
+    ret_miss = strategy.prepare_retrieve(
+        key=key,
+        instance_id=7,
+        resolve_obj_keys=lambda _k: partial_keys[0],
+        group_keys=partial_keys,
+    )
+    assert ret_miss.success is False
 
 
 def test_register_payload_carries_group_layouts() -> None:

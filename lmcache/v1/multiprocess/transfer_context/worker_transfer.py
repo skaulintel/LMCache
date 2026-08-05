@@ -34,6 +34,7 @@ from lmcache.v1.multiprocess.transfer_context.base import (
     gather_paged_kv_to_cpu,
     scatter_cpu_to_paged_kv,
 )
+from lmcache.v1.multiprocess.transfer_context.pickle import EngineDrivenContextPickle
 from lmcache.v1.platform import get_device_spec, resolve_kv_wrapper_factory
 from lmcache.v1.platform.base.event_ipc import (
     EventIPCBackend,
@@ -709,11 +710,11 @@ class EngineDrivenTransferContext(TransferContext):
         With multiple ``engine_group_infos`` (hybrid-KV models), each group's
         layers are described by their own layout and gathered/scattered with
         that group's block-id list (uniform coverage: every group stores and
-        retrieves every chunk). Sliding-window groups are rejected because
-        uniform coverage is only correct when every group holds blocks for the
-        full token range, and multi-group transfer requires the SHM transport
-        (pickle mode is rejected). Single-group registration keeps the legacy
-        path (see ``_single_group_block_ids``).
+        retrieves every chunk; sliding-window groups keep only the trailing
+        window of each chunk). Works over both transports: SHM gathers into
+        server-reserved slots, pickle serializes a group-major payload.
+        Single-group registration keeps the legacy path (see
+        ``_single_group_block_ids``).
         """
         del engine_type  # unused on the engine-driven path
         # TODO: per-group compression (EngineGroupInfo.tokens_per_block vs the
@@ -851,12 +852,6 @@ class EngineDrivenTransferContext(TransferContext):
             pool_size=pool_size,
         )
         supported_transfer_mode = "SHM" if shm_name and pool_size > 0 else "pickle"
-        if self._group_states and supported_transfer_mode != "SHM":
-            raise RuntimeError(
-                "engine-driven multi-group transfer requires the SHM "
-                "transport, but the server returned no SHM pool (pickle "
-                "mode). Enable a non-lazy L1 pool on the MP server."
-            )
         logger.info(
             "Worker non-GPU transfer context registered "
             "(instance_id=%d, mode=%s, groups=%d)",
@@ -987,6 +982,10 @@ class EngineDrivenTransferContext(TransferContext):
                 f"got {len(block_ids)} block-id lists for "
                 f"{len(self._group_states)} registered groups"
             )
+        if isinstance(ctx, EngineDrivenContextPickle):
+            return self._submit_store_multigroup_pickle(
+                ctx, key, instance_id, kv_caches, block_ids
+            )
         torch_dev.synchronize()
         result = ctx.prepare_store_grouped(key, instance_id)
         if result is None:
@@ -1016,6 +1015,81 @@ class EngineDrivenTransferContext(TransferContext):
         future.set_result(ok)
         return future
 
+    def _submit_store_multigroup_pickle(
+        self,
+        ctx: "EngineDrivenContextPickle",
+        key: Any,
+        instance_id: int,
+        kv_caches: dict[str, torch.Tensor],
+        block_ids: list[list[int]],
+    ) -> MessagingFuture:
+        """Uniform-coverage store over pickle: group-major serialized payload.
+
+        There are no server-reserved slots in pickle mode, so each group's
+        chunks are gathered into fresh CPU tensors and the whole
+        ``chunks[group][chunk]`` list is pickled in one COMMIT_STORE payload.
+        """
+        future: MessagingFuture[bool] = MessagingFuture()
+        torch_dev.synchronize()
+        # Handshake only: the pickle strategy reserves nothing at prepare.
+        ctx.prepare_store(key, instance_id)
+        group_chunks: list[list[torch.Tensor]] = []
+        for gid, state in enumerate(self._group_states):
+            group_chunks.append(
+                gather_paged_kv_to_cpu(
+                    {name: kv_caches[name] for name in state.layer_names},
+                    block_ids[gid],
+                    state.blocks_in_chunk,
+                    layout_hints=self._layout_hints,
+                    engine_kv_format=state.engine_kv_format,
+                    blocks_per_window=state.blocks_per_window,
+                )
+            )
+        ok = ctx.commit_store(key, instance_id, group_chunks)
+        future.set_result(ok)
+        return future
+
+    def _submit_retrieve_multigroup_pickle(
+        self,
+        ctx: "EngineDrivenContextPickle",
+        key: Any,
+        instance_id: int,
+        kv_caches: dict[str, torch.Tensor],
+        block_ids: list[list[int]],
+        skip_first_n_tokens: int,
+    ) -> MessagingFuture:
+        """Uniform-coverage retrieve over pickle: scatter a group-major payload."""
+        future: MessagingFuture[bool] = MessagingFuture()
+        group_chunks = ctx.prepare_retrieve_multigroup(key, instance_id)
+        if group_chunks is not None and len(group_chunks) != len(self._group_states):
+            logger.error(
+                "pickle retrieve returned %d groups for %d registered groups",
+                len(group_chunks),
+                len(self._group_states),
+            )
+            group_chunks = None
+        ok = group_chunks is not None
+        if group_chunks is not None:
+            try:
+                for gid, state in enumerate(self._group_states):
+                    scatter_cpu_to_paged_kv(
+                        {name: kv_caches[name] for name in state.layer_names},
+                        block_ids[gid],
+                        group_chunks[gid],
+                        state.blocks_in_chunk,
+                        skip_first_n_tokens=skip_first_n_tokens,
+                        layout_hints=self._layout_hints,
+                        engine_kv_format=state.engine_kv_format,
+                        blocks_per_window=state.blocks_per_window,
+                    )
+            except (RuntimeError, ValueError, TypeError, IndexError):
+                logger.exception("Failed to scatter retrieved CPU context chunks")
+                ok = False
+            torch_dev.synchronize()
+        ctx.commit_retrieve(key, instance_id)
+        future.set_result(ok)
+        return future
+
     def _submit_retrieve_multigroup(
         self,
         key: Any,
@@ -1032,6 +1106,10 @@ class EngineDrivenTransferContext(TransferContext):
             raise RuntimeError(
                 f"got {len(block_ids)} block-id lists for "
                 f"{len(self._group_states)} registered groups"
+            )
+        if isinstance(ctx, EngineDrivenContextPickle):
+            return self._submit_retrieve_multigroup_pickle(
+                ctx, key, instance_id, kv_caches, block_ids, skip_first_n_tokens
             )
         result = ctx.prepare_retrieve_grouped(key, instance_id)
         ok = result is not None
