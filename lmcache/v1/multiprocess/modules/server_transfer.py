@@ -226,18 +226,40 @@ class PickleTransferStrategy(TransferStrategy):
                 if obj_key not in reserved_dict:
                     continue
                 if idx >= len(chunks):
+                    logger.error(
+                        "pickle store payload has %d chunks but chunk %d "
+                        "was reserved for key %s",
+                        len(chunks),
+                        idx,
+                        obj_key,
+                    )
                     continue
                 memory_obj = reserved_dict[obj_key]
                 if memory_obj.tensor is None:
                     continue
                 chunk_cpu = chunks[idx]
                 if chunk_cpu.shape != memory_obj.tensor.shape:
+                    logger.error(
+                        "pickle store chunk %d shape %s does not match "
+                        "reserved layout %s for key %s",
+                        idx,
+                        tuple(chunk_cpu.shape),
+                        tuple(memory_obj.tensor.shape),
+                        obj_key,
+                    )
                     continue
                 memory_obj.tensor.copy_(chunk_cpu)
                 written_keys.append(obj_key)
         finally:
             if written_keys:
                 self._storage_manager.finish_write(written_keys)
+            # Release reservations that were never written so their write
+            # locks don't wedge later operations on the same keys, then drop
+            # the unwritten objects so they can never surface as cache hits.
+            leftover = [k for k in reserved_dict if k not in set(written_keys)]
+            if leftover:
+                self._storage_manager.finish_write(leftover)
+                self._storage_manager.delete_l1_keys(leftover)
         return len(written_keys), len(reserved_dict)
 
     def commit_store(

@@ -416,6 +416,7 @@ class _FakeStorageManager:
         self.objs: dict[ObjectKey, _FakeMemoryObj] = {}
         self.finished_writes: list[ObjectKey] = []
         self.finished_reads: list[ObjectKey] = []
+        self.deleted: list[ObjectKey] = []
 
     def reserve_write(self, obj_keys, _layout, _mode):
         reserved = {}
@@ -427,6 +428,12 @@ class _FakeStorageManager:
 
     def finish_write(self, keys):
         self.finished_writes.extend(keys)
+
+    def delete_l1_keys(self, keys, force=False):
+        self.deleted.extend(keys)
+        for key in keys:
+            self.objs.pop(key, None)
+        return len(keys), 0
 
     @contextmanager
     def read_prefetched_results(self, obj_keys):
@@ -491,6 +498,47 @@ def test_pickle_strategy_multigroup_store_retrieve_roundtrip() -> None:
         group_keys=partial_keys,
     )
     assert ret_miss.success is False
+
+
+def test_pickle_strategy_store_shape_mismatch_releases_reservations() -> None:
+    """A chunk whose shape disagrees with the reserved layout fails the store,
+    and the unwritten reservations are released and deleted -- they must not
+    wedge later writes or surface as garbage cache hits."""
+    shapes: dict[int, tuple[int, ...]] = {0: (2, 2, 8, 16), 1: (2, 1, 4, 4)}
+    sm = _FakeStorageManager(shapes)
+    strategy = PickleTransferStrategy(sm)  # type: ignore[arg-type]
+    metadata = _group_metadata()
+    key = IPCCacheServerKey.from_token_ids(
+        "m", 1, 0, [1] * 16, start=0, end=16, request_id="req-pkl-mismatch"
+    )
+    group_keys = [
+        [_obj_key(1, 0), _obj_key(2, 0)],
+        [_obj_key(1, 1), _obj_key(2, 1)],
+    ]
+    # Group 1 chunks are chunk-sized (8 tokens) while its reserved layout is
+    # window-sized (4 tokens): the exact worker/server drift this guards.
+    payload = [
+        [torch.full(shapes[0], float(c)) for c in range(2)],
+        [torch.full((2, 1, 8, 4), float(10 + c)) for c in range(2)],
+    ]
+
+    assert (
+        strategy.commit_store(
+            key=key,
+            instance_id=7,
+            cpu_data=_pickle.dumps(payload),
+            context=metadata,
+            resolve_obj_keys=lambda _k: group_keys[0],
+            group_keys=group_keys,
+        )
+        is False
+    )
+    # Every reservation was finished (written or released) and the two
+    # mismatched group-1 objects were deleted rather than left as garbage.
+    assert set(sm.finished_writes) == set(group_keys[0]) | set(group_keys[1])
+    assert set(sm.deleted) == set(group_keys[1])
+    assert _obj_key(1, 1) not in sm.objs
+    assert _obj_key(2, 1) not in sm.objs
 
 
 def test_register_payload_carries_group_layouts() -> None:

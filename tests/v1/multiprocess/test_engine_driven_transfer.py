@@ -827,6 +827,78 @@ def test_gather_scatter_roundtrip_hnd_layout(
             assert torch.allclose(source[name][1], destination[name][5])
 
 
+def test_gather_sliding_window_allocates_window_sized_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """out=None gather for a sliding-window group must allocate window-sized
+    chunks: that is the shape the server reserves for the group
+    (``GroupLayout.window_tokens``), so a chunk-sized buffer makes the
+    pickle-path commit_store reject every chunk. The chunk content is the
+    trailing window blocks, and scatter writes it back to the trailing
+    blocks of each destination chunk."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context.base import (
+        gather_paged_kv_to_cpu,
+        scatter_cpu_to_paged_kv,
+    )
+
+    def _vllm_detector_device_type() -> str:
+        return torch_device_type if torch_device_type != "cpu" else "cuda"
+
+    monkeypatch.setattr(
+        "lmcache.v1.gpu_connector.kv_format.detectors.vllm.torch_device_type",
+        _vllm_detector_device_type(),
+    )
+
+    num_layers, block_size, hidden_dim = 2, 4, 16
+    source = {
+        k: v.to(torch_device_type)
+        for k, v in _make_kv_caches(
+            num_layers=num_layers,
+            num_blocks=8,
+            block_size=block_size,
+            num_heads=4,
+            head_size=4,
+        ).items()
+    }
+    blocks_per_chunk = 2
+    blocks_per_window = 1  # keep the trailing 1 of 2 blocks per chunk
+    window_tokens = blocks_per_window * block_size
+
+    gathered = gather_paged_kv_to_cpu(
+        source,
+        [0, 1, 2, 3],
+        blocks_per_chunk,
+        blocks_per_window=blocks_per_window,
+    )
+    assert len(gathered) == 2
+    for chunk in gathered:
+        assert tuple(chunk.shape) == (2, num_layers, window_tokens, hidden_dim)
+    # Chunk content is the trailing window block (blocks 1 and 3).
+    for chunk, src_block in zip(gathered, (1, 3), strict=True):
+        for layer_idx in range(num_layers):
+            expected = source[f"layer_{layer_idx}"][:, src_block].reshape(
+                2, block_size, hidden_dim
+            )
+            assert torch.allclose(chunk[:, layer_idx].cpu(), expected.cpu())
+
+    destination = {name: torch.zeros_like(tensor) for name, tensor in source.items()}
+    scatter_cpu_to_paged_kv(
+        destination,
+        [4, 5, 6, 7],
+        gathered,
+        blocks_per_chunk,
+        blocks_per_window=blocks_per_window,
+    )
+    torch_dev.synchronize()
+    for name in source:
+        # Trailing window blocks are restored; leading blocks stay zero.
+        assert torch.allclose(source[name][:, 1], destination[name][:, 5])
+        assert torch.allclose(source[name][:, 3], destination[name][:, 7])
+        assert destination[name][:, 4].abs().sum() == 0
+        assert destination[name][:, 6].abs().sum() == 0
+
+
 def test_compute_kv_layout_empty_raises_value_error() -> None:
     """Ensure compute_kv_layout rejects empty KV cache input."""
     # First Party

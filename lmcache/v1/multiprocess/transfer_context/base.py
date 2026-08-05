@@ -411,11 +411,14 @@ def gather_paged_kv_to_cpu(
             (backward-compatible behaviour).
 
     Returns:
-        List of CPU tensors, one per chunk. For split-K/V formats each chunk
-        has shape ``[2, num_layers, chunk_tokens, hidden_dim]`` where
-        dimension ``0`` stores ``(K, V)``. For single-plane formats
-        (``kv_size == 1``: MLA and fused-K/V) each chunk has shape
-        ``[num_layers, chunk_tokens, num_heads * head_size]`` — for fused
+        List of CPU tensors, one per chunk, sized to the stored token window
+        (``window_tokens = blocks_per_window * block_size`` when
+        ``blocks_per_window`` is given, else the full chunk). For split-K/V
+        formats each chunk has shape
+        ``[2, num_layers, window_tokens, hidden_dim]`` where dimension ``0``
+        stores ``(K, V)``. For single-plane formats (``kv_size == 1``: MLA
+        and fused-K/V) each chunk has shape
+        ``[num_layers, window_tokens, num_heads * head_size]`` — for fused
         formats ``head_size`` is the packed ``2 * head_size``.
 
     Raises:
@@ -486,10 +489,14 @@ def gather_paged_kv_to_cpu(
     if out is None:
         # One object plane per K/V entry: MLA and fused-K/V formats
         # (kv_size == 1) store a single plane, split formats store K and V.
+        # Size buffers to the stored window: the kernel writes window_tokens
+        # per object, and window-sized chunks are what the server reserves for
+        # a sliding-window group. window_tokens == chunk_tokens for full
+        # attention, so this is the historical shape everywhere else.
         if get_kv_size(normalized, engine_kv_format) == 1:
             chunks = [
                 torch.empty(
-                    (num_layers, chunk_tokens, content_size),
+                    (num_layers, window_tokens, content_size),
                     dtype=tensors[0].dtype,
                     device=torch.device("cpu"),
                     pin_memory=requires_pinned,
@@ -499,7 +506,7 @@ def gather_paged_kv_to_cpu(
         else:
             chunks = [
                 torch.empty(
-                    (2, num_layers, chunk_tokens, content_size),
+                    (2, num_layers, window_tokens, content_size),
                     dtype=tensors[0].dtype,
                     device=torch.device("cpu"),
                     pin_memory=requires_pinned,
