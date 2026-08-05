@@ -335,18 +335,24 @@ def test_submit_store_multigroup_pickle_sends_group_major_payload(
     ctx, pctx, _ = _pickle_worker_ctx(monkeypatch)
     gathered = [["g0c0", "g0c1"], ["g1c0"]]
     calls: list[dict] = []
+    events: list[str] = []
 
     def _fake_gather(*_a: Any, **kwargs: Any):
         idx = len(calls)
         calls.append(kwargs)
+        events.append("gather")
         return gathered[idx]
 
     monkeypatch.setattr(worker_transfer, "gather_paged_kv_to_cpu", _fake_gather)
+    monkeypatch.setattr(
+        worker_transfer.torch_dev, "synchronize", lambda: events.append("sync")
+    )
     monkeypatch.setattr(pctx, "prepare_store", lambda _k, _i: None)
     committed: dict[str, Any] = {}
 
     def _fake_commit(_k: Any, _i: int, chunks: Any) -> bool:
         committed["chunks"] = chunks
+        events.append("commit")
         return True
 
     monkeypatch.setattr(pctx, "commit_store", _fake_commit)
@@ -360,6 +366,12 @@ def test_submit_store_multigroup_pickle_sends_group_major_payload(
     assert committed["chunks"] == gathered
     # Fresh CPU gathers: no slot tensors, no chunk-index filtering.
     assert all(c.get("out") is None and c.get("chunk_indices") is None for c in calls)
+    # Gather issues async device->CPU copies and commit serializes the
+    # buffers, so a device synchronize must sit between the last gather and
+    # the commit.
+    last_gather = max(i for i, e in enumerate(events) if e == "gather")
+    commit_idx = events.index("commit")
+    assert "sync" in events[last_gather + 1 : commit_idx]
 
 
 def test_submit_retrieve_multigroup_pickle_scatters_group_major(
