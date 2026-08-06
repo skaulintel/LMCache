@@ -827,6 +827,75 @@ def test_gather_scatter_roundtrip_hnd_layout(
             assert torch.allclose(source[name][1], destination[name][5])
 
 
+def test_scatter_unpinned_chunks_survive_back_to_back_groups() -> None:
+    """Back-to-back scatters of UNPINNED chunks must not corrupt each other.
+
+    The compiled scatter path pins unpinned chunks into temporary copies and
+    launches async H2D reads on them through raw pointers, which torch's
+    stream tracking cannot see. Without completing the launches before the
+    temporaries are released, the caching host allocator hands their memory
+    to the next group's pin_memory() while the previous group's copies are
+    still in flight -- the engine-driven pickle retrieve path scatters one
+    group after another and hit exactly this. Unpinned inputs are the
+    contract here: the pickle payload arrives unpickled and unpinned.
+    """
+    # Third Party
+    import pytest as _pytest
+
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context.base import (
+        _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR,
+        scatter_cpu_to_paged_kv,
+    )
+
+    if not torch.cuda.is_available() or _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR:
+        _pytest.skip("needs CUDA and compiled block-transfer ops")
+
+    torch.manual_seed(0)
+    dev = "cuda:0"
+    num_layers, block_size, heads, hs = 4, 16, 4, 32
+    bpc, num_chunks, num_groups = 8, 5, 6
+
+    sources, dests, chunk_lists, id_lists = [], [], [], []
+    for g in range(num_groups):
+        nblocks = num_chunks * bpc + 2
+        src = {
+            f"g{g}_l{i}": torch.randn(2, nblocks, block_size, heads, hs, device=dev)
+            for i in range(num_layers)
+        }
+        block_ids = list(range(num_chunks * bpc))
+        chunks = []
+        for c in range(num_chunks):
+            blk = block_ids[c * bpc : (c + 1) * bpc]
+            per_layer = [
+                torch.stack([src[f"g{g}_l{i}"][:, b] for b in blk], dim=1).reshape(
+                    2, bpc * block_size, heads * hs
+                )
+                for i in range(num_layers)
+            ]
+            # Plain (unpinned) CPU tensors, as an unpickled payload would be.
+            chunks.append(
+                torch.stack(per_layer, dim=1)
+                .reshape(2, num_layers, bpc * block_size, heads * hs)
+                .cpu()
+            )
+        sources.append(src)
+        dests.append({k: torch.zeros_like(v) for k, v in src.items()})
+        chunk_lists.append(chunks)
+        id_lists.append(block_ids)
+
+    for g in range(num_groups):
+        scatter_cpu_to_paged_kv(dests[g], id_lists[g], chunk_lists[g], bpc)
+    torch.cuda.synchronize()
+
+    for g in range(num_groups):
+        for name in sources[g]:
+            for b in id_lists[g]:
+                assert torch.allclose(sources[g][name][:, b], dests[g][name][:, b]), (
+                    f"corrupted block {b} of {name}"
+                )
+
+
 def test_gather_sliding_window_allocates_window_sized_chunks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

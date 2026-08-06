@@ -781,7 +781,8 @@ def scatter_cpu_to_paged_kv(
         # Defensive check: Ensure all incoming CPU chunks are pinned memory.
         # Otherwise, the underlying CUDA kernel may throw an Illegal
         # Memory Access error during H2D transfer.
-        if not all(chunk.is_pinned() for chunk in chunks):
+        dynamically_pinned = not all(chunk.is_pinned() for chunk in chunks)
+        if dynamically_pinned:
             logger.warning(
                 "Received unpinned CPU tensors in scatter_cpu_to_paged_kv. "
                 "Dynamically pinning memory now, which may incur additional"
@@ -836,6 +837,15 @@ def scatter_cpu_to_paged_kv(
                 engine_kv_format,
                 launch.skip_blocks,
             )
+        if dynamically_pinned:
+            # The temporary pinned copies are consumed by the async H2D
+            # launches through raw pointers, which torch's stream tracking
+            # cannot see. Returning would drop the last references, and the
+            # caching host allocator would hand the memory to the next
+            # caller while the copies are still in flight -- the next
+            # group's pin_memory() then overwrites the bytes mid-transfer.
+            # Complete the launches before releasing the references.
+            torch_dev.synchronize()
     # Fast path: The async GPU copy might still be in progress.
     # We intentionally omit synchronization here for performance.
     # WARNING: The caller MUST explicitly call `torch_dev.synchronize()`
