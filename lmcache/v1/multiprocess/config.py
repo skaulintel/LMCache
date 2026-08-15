@@ -6,6 +6,7 @@ Configuration for the multiprocess (ZMQ) server and HTTP frontend.
 
 # Standard
 from dataclasses import dataclass, field
+from typing import Literal
 import argparse
 import json
 import math
@@ -61,7 +62,9 @@ class MPServerConfig:
     L1-resident (served by the sparse leg as L1 hits, the hole recomputed)
     instead of truncating the prefix at the gap. No effect for other engines."""
 
-    supported_transfer_mode: str = "auto"
+    supported_transfer_mode: Literal["lmcache_driven", "engine_driven", "auto"] = (
+        "lmcache_driven"
+    )
     """Transfer mode: 'lmcache_driven' for server-driven transfer
     (STORE/RETRIEVE, supports CUDA IPC and CPU SHM), 'engine_driven' for
     engine-driven transfer (PREPARE/COMMIT), or 'auto' to enable both."""
@@ -75,9 +78,9 @@ class MPServerConfig:
     """Peer-to-peer configuration. P2P is enabled when its advertise URL is
     set."""
 
-    shm_name: str | None = None
+    shm_name: str | None = ""
     """SHM segment name for engine-driven KV transfer.
-    None: auto-allocate (default). "": force pickle. Other: use that name."""
+    "" (default): force pickle. None: auto-allocate. Other: use that name."""
 
     script_allowed_imports: list[str] = field(default_factory=list)
     """Modules that /run_script endpoint is allowed to import."""
@@ -219,9 +222,9 @@ class CoordinatorConfig:
     the coordinator's ``INSTANCE_TIMEOUT``."""
 
     event_reporting: bool = False
-    """When ``True``, report cache events to the coordinator: the key
-    directory's store/access/delete stream (fleet-wide placement tracking)
-    and the L2 usage stream (quota tracking and eviction)."""
+    """When ``True``, stream cache store/access/delete events to the
+    coordinator, feeding the key directory (fleet-wide placement
+    tracking) and, for L2 events, usage/quota tracking and eviction."""
 
     event_flush_interval: float = 1.0
     """Seconds between cache-event flush attempts to the coordinator."""
@@ -313,12 +316,13 @@ def add_mp_server_args(
     mp_group.add_argument(
         "--supported-transfer-mode",
         type=str,
-        default="auto",
+        default="lmcache_driven",
         choices=["lmcache_driven", "engine_driven", "auto"],
         help="Supported transfer mode: 'lmcache_driven' for server-driven "
         "transfer (STORE/RETRIEVE, supports CUDA IPC and CPU SHM), "
         "'engine_driven' for engine-driven transfer (PREPARE/COMMIT), "
-        "or 'auto' to enable both transfer paths. Default is 'auto'.",
+        "or 'auto' to enable both transfer paths. "
+        "Default is 'lmcache_driven'.",
     )
     mp_group.add_argument(
         "--runtime-plugin-locations",
@@ -340,11 +344,12 @@ def add_mp_server_args(
     mp_group.add_argument(
         "--shm-name",
         type=str,
-        default=None,
+        default="",
         help="SHM segment name for engine-driven KV transfer. "
-        "Default (not specified): auto-allocate. "
-        'Set to "" to force pickle path (disable SHM). '
-        "Set to a name to use that specific SHM segment.",
+        'Default "" (not specified): disable SHM. '
+        "Set to a name to create and use that specific SHM segment. "
+        "(Only use this for engine_driven transfer mode, see "
+        "`--supported-transfer-mode`.) ",
     )
     mp_group.add_argument(
         "--script-allowed-imports",
@@ -602,9 +607,9 @@ def add_coordinator_args(
         "--coordinator-event-reporting",
         action="store_true",
         default=None,
-        help="Report cache events to the coordinator: the key directory's "
-        "store/access/delete stream (placement tracking) and the L2 usage "
-        "stream (quota tracking and eviction). Defaults to "
+        help="Stream cache store/access/delete events to the coordinator, "
+        "feeding the key directory (placement tracking) and, for L2 "
+        "events, usage/quota tracking and eviction. Defaults to "
         "LMCACHE_COORDINATOR_EVENT_REPORTING; unset disables.",
     )
     group.add_argument(
