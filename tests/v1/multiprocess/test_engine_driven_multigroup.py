@@ -23,11 +23,28 @@ from lmcache.v1.multiprocess.custom_types import (
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.modules.server_transfer import PickleTransferStrategy
 from lmcache.v1.multiprocess.transfer_context import worker_transfer
-from lmcache.v1.multiprocess.transfer_context.base import EngineDrivenContextMetadata
+from lmcache.v1.multiprocess.transfer_context.base import (
+    EngineDrivenContextMetadata,
+    compute_kv_layout,
+)
 from lmcache.v1.multiprocess.transfer_context.pickle import EngineDrivenContextPickle
 from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
     EngineDrivenTransferContext,
 )
+
+
+def _detected_block_size(kv_caches: dict[str, torch.Tensor]) -> int:
+    """Return the block size registration will derive for ``kv_caches``.
+
+    A 5-D per-layer tensor is ``[2, NB, BS, NH, HS]`` under NHD and
+    ``[2, NB, NH, BS, HS]`` under HND, so the block size depends on the
+    layout the detector resolves -- which is process-level (vLLM's CPU
+    backend is forced to HND, GPU defaults to NHD). Tests derive it from
+    the same helper registration uses instead of hard-coding one layout's
+    value, so they hold wherever they run.
+    """
+    block_size, *_ = compute_kv_layout(kv_caches)
+    return block_size
 
 
 def _obj_key(chunk_hash: int, group: int) -> ObjectKey:
@@ -276,6 +293,12 @@ def test_register_accepts_sliding_window_groups() -> None:
     the payload carries the reduced per-group window."""
     ctx = EngineDrivenTransferContext()
     kv = {f"layer_{i}": torch.zeros(2, 4, 4, 2, 8) for i in range(2)}
+    # Half a chunk, so the window is always one of the two blocks per chunk.
+    # A fixed token count would exceed the chunk under a layout that resolves
+    # a smaller block size, and the group would silently degrade to full
+    # attention -- testing nothing.
+    chunk_tokens = 2 * _detected_block_size(kv)
+    sw_tokens = chunk_tokens // 2
 
     # First Party
     from lmcache.v1.multiprocess.protocols.engine import (
@@ -303,18 +326,20 @@ def test_register_accepts_sliding_window_groups() -> None:
         send_request=_send,
         engine_group_infos=[
             EngineGroupInfo(engine_group_id=0, layer_indices=(0,)),
-            EngineGroupInfo(engine_group_id=1, layer_indices=(1,), sw_size_tokens=4),
+            EngineGroupInfo(
+                engine_group_id=1, layer_indices=(1,), sw_size_tokens=sw_tokens
+            ),
         ],
     )
-    # chunk_tokens = blocks_in_chunk(2) * block_size(4) = 8; group 1's 4-token
-    # window is 1 of 2 blocks per chunk. Group 0 (full attention) keeps both.
+    # Group 1's half-chunk window is 1 of the 2 blocks per chunk. Group 0
+    # (full attention) keeps both.
     full, sw = ctx._group_states
     assert full.blocks_per_window == full.blocks_in_chunk == 2
     assert sw.blocks_in_chunk == 2
     assert sw.blocks_per_window == 1
     payload: RegisterEngineDrivenContextPayload = sent[0]
-    assert payload.group_layouts[0].window_tokens == 8  # full attention
-    assert payload.group_layouts[1].window_tokens == 4  # sliding window
+    assert payload.group_layouts[0].window_tokens == chunk_tokens  # full attention
+    assert payload.group_layouts[1].window_tokens == sw_tokens  # sliding window
 
 
 def _pickle_worker_ctx(monkeypatch):
@@ -593,8 +618,9 @@ def test_register_payload_carries_group_layouts() -> None:
     assert payload.group_layouts[1].num_layers == 1
     assert isinstance(payload.group_layouts[0], GroupLayout)
     # Full-attention groups carry the full chunk as their window
-    # (blocks_in_chunk 2 * block_size 4 = 8 tokens).
-    assert payload.group_layouts[0].window_tokens == 8
-    assert payload.group_layouts[1].window_tokens == 8
+    # (blocks_in_chunk * block_size).
+    chunk_tokens = 2 * _detected_block_size(kv)
+    assert payload.group_layouts[0].window_tokens == chunk_tokens
+    assert payload.group_layouts[1].window_tokens == chunk_tokens
     assert len(ctx._group_states) == 2
     assert ctx._group_states[1].layer_names == ["layer_2"]
