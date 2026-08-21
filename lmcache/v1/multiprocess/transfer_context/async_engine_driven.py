@@ -13,11 +13,9 @@ import torch
 from lmcache import torch_dev
 from lmcache.logging import init_logger
 from lmcache.v1.multiprocess.futures import MessagingFuture
-from lmcache.v1.multiprocess.transfer_context.base import gather_paged_kv_to_cpu
 from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
     EngineDrivenTransferContext,
     IPCEvent,
-    _single_group_block_ids,
 )
 
 logger = init_logger(__name__)
@@ -55,9 +53,9 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
        perform commit_store() and resolve the returned future.
 
     ``submit_store`` performs only O(1) work on the forward thread (registration
-    check and block-id flattening) before submitting all three phases to the
-    background ``commit_executor``, so the forward thread is never blocked by
-    the RPC round-trip or gather kernel launch latency.
+    check and per-group block-id validation) before submitting all three phases
+    to the background ``commit_executor``, so the forward thread is never
+    blocked by the RPC round-trip or gather kernel launch latency.
 
     This class is only instantiated by the factory when the device is
     async-capable, so the constructor creates async resources unconditionally;
@@ -164,7 +162,7 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
         """Three-phase async store (prepare, gather and commit all in background).
 
         Performs only O(1) work on the forward thread (registration check and
-        block-id flattening), then submits all three phases — prepare_store,
+        per-group block-id validation), then submits all three phases — prepare_store,
         gather (GPU->CPU), and commit — to the background ``commit_executor``.
         Returns an unresolved future that resolves only after all three phases
         complete.
@@ -204,7 +202,9 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                     return completion
                 self._pending_stores.add(gather_launched)
 
-            full_block_ids = _single_group_block_ids(block_ids)
+            # Fail fast on the forward thread if the request's per-group block
+            # ID lists do not match the registered KV groups.
+            self._require_group_plans(block_ids)
 
             def _prepare_gather_and_commit() -> None:
                 gather_done: Any | None = None
@@ -230,7 +230,7 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                     num_chunks = (
                         len(chunk_indices)
                         if chunk_indices is not None
-                        else len(full_block_ids) // blocks_in_chunk
+                        else len(block_ids[0]) // blocks_in_chunk
                     )
 
                     # Determine gather target:
@@ -260,14 +260,12 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                     with torch.inference_mode(), torch_dev.stream(self._copy_stream):
                         _event.wait(stream=self._copy_stream)
 
-                        gather_paged_kv_to_cpu(
+                        self._gather_groups(
                             kv_caches,
-                            full_block_ids,
+                            block_ids,
                             blocks_in_chunk,
-                            layout_hints=self._layout_hints,
-                            engine_kv_format=self._engine_kv_format,
-                            out=gather_target,
-                            chunk_indices=chunk_indices,
+                            gather_target,
+                            chunk_indices,
                         )
 
                         gather_done = torch_dev.Event()
