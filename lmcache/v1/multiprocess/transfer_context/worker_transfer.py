@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Protocol
+import math
 import os
 
 # Third Party
@@ -734,7 +735,22 @@ class EngineDrivenTransferContext(TransferContext):
         # The wire field is named use_mla but only drives the object plane
         # count: single-plane (kv_size == 1) covers MLA and fused-K/V formats.
         use_mla_flag = kv_size == 1
-        chunk_tokens = blocks_in_chunk * block_size
+        # `blocks_in_chunk` counts the engine's *scheduling* blocks, whose size is
+        # the LCM of the per-group block sizes (vLLM: `scheduler_block_size =
+        # math.lcm(*group_block_sizes)`), not the block size of whichever layer
+        # happens to come first in `kv_caches`. With one geometry the two agree;
+        # with several they do not, and multiplying by the detected size shrinks
+        # the chunk -- gemma-4 registered 4 x 32 = 128 tokens per chunk instead of
+        # 4 x 64 = 256, so half of every chunk's KV was never stored and retrieve
+        # returned garbage.
+        reported_blocks = [
+            group.tokens_per_block
+            for group in engine_group_infos
+            if group.tokens_per_block
+        ]
+        chunk_tokens = blocks_in_chunk * (
+            math.lcm(*reported_blocks) if reported_blocks else block_size
+        )
 
         group_layouts: list[GroupLayout] = []
         group_states: list[_GroupState] = []
