@@ -20,6 +20,7 @@ from lmcache.v1.multiprocess.transfer_context import (
 from lmcache.v1.multiprocess.transfer_context.async_engine_driven import (
     AsyncEngineDrivenTransferContext,
 )
+from lmcache.v1.multiprocess.transfer_context.pickle import EngineDrivenContextPickle
 from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
     EngineDrivenTransferContext,
 )
@@ -457,4 +458,306 @@ def test_prepare_store_runs_on_background_thread_not_forward_thread(
     # Now release prepare_store and let the background work complete.
     prepare_gate.set()
     t.join(timeout=1)
+    ctx.close()
+
+
+class _FakeGroupedStoreContext:
+    """Grouped engine-driven context fake capturing the commit argument."""
+
+    def __init__(self, prep: tuple[list[torch.Tensor], list[int], list[int]] | None):
+        self._prep = prep
+        self.commit_arg: object = "not-called"
+
+    def prepare_store_grouped(
+        self, _key: object, _instance_id: int
+    ) -> tuple[list[torch.Tensor], list[int], list[int]] | None:
+        return self._prep
+
+    def commit_store(self, _key: object, _instance_id: int, chunks: object) -> bool:
+        self.commit_arg = chunks
+        return True
+
+    def close(self) -> None:
+        return None
+
+
+def _grouped_async_ctx(
+    monkeypatch: pytest.MonkeyPatch,
+    gather_gate: threading.Event,
+    *,
+    gather_impl: Callable[..., object] | None = None,
+) -> tuple[AsyncEngineDrivenTransferContext, list[dict]]:
+    """Async context with two registered groups of different geometry.
+
+    Group 0 is a sliding-window group (2 blocks/chunk, keeps 1) whose chunk
+    shape differs from group 1's full-attention chunk, which is what mixed KV
+    geometry looks like to the store path.
+    """
+    monkeypatch.setattr(async_engine_driven, "torch_dev", _FakeTorchDev(gather_gate))
+    ctx = AsyncEngineDrivenTransferContext(commit_workers=2)
+    ctx._group_states = [
+        worker_transfer._GroupState(
+            layer_names=["layer_0", "layer_1"],
+            engine_kv_format=MagicMock(),
+            blocks_in_chunk=2,
+            blocks_per_window=1,
+            layout_desc=SimpleNamespace(
+                shapes=[torch.Size([2, 2, 1, 4])], dtypes=[torch.float16]
+            ),
+        ),
+        worker_transfer._GroupState(
+            layer_names=["layer_2"],
+            engine_kv_format=MagicMock(),
+            blocks_in_chunk=1,
+            blocks_per_window=1,
+            layout_desc=SimpleNamespace(
+                shapes=[torch.Size([2, 1, 2, 8])], dtypes=[torch.float16]
+            ),
+        ),
+    ]
+    calls: list[dict] = []
+
+    def _fake_gather(
+        kv_caches: dict[str, torch.Tensor],
+        block_ids: list[int],
+        blocks_in_chunk: int,
+        **kwargs: object,
+    ) -> object:
+        calls.append(
+            {
+                "layers": sorted(kv_caches),
+                "block_ids": block_ids,
+                "blocks_in_chunk": blocks_in_chunk,
+                "blocks_per_window": kwargs.get("blocks_per_window"),
+                "out": kwargs.get("out"),
+                "chunk_indices": kwargs.get("chunk_indices"),
+            }
+        )
+        if gather_impl is not None:
+            return gather_impl(len(calls) - 1)
+        return kwargs.get("out")
+
+    # Both modules: the single-group gather is called from async_engine_driven,
+    # the per-group fan-out from the shared _gather_groups in worker_transfer.
+    monkeypatch.setattr(async_engine_driven, "gather_paged_kv_to_cpu", _fake_gather)
+    monkeypatch.setattr(worker_transfer, "gather_paged_kv_to_cpu", _fake_gather)
+    return ctx, calls
+
+
+_KV_THREE_LAYERS = {name: torch.zeros(1) for name in ("layer_0", "layer_1", "layer_2")}
+
+
+def test_submit_store_multigroup_shm_fans_out_in_background(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each group gathers into its own server slots, off the forward thread.
+
+    The future must stay unresolved until the gather event fires, which is the
+    whole point: before this, a multi-group store ran synchronously on the
+    model-forward thread.
+    """
+    gather_gate = threading.Event()
+    ctx, calls = _grouped_async_ctx(monkeypatch, gather_gate)
+    slots = [torch.zeros(1) for _ in range(4)]
+    fake = _FakeGroupedStoreContext((slots, [0, 1, 0, 1], [0, 0, 1, 1]))
+    ctx._engine_driven_context = fake  # type: ignore[assignment]
+
+    future = ctx.submit_store(
+        "req",
+        object(),
+        1,
+        _KV_THREE_LAYERS,
+        [[1, 2, 3, 4], [5, 6]],
+        _FakeEvent(gather_gate),
+        2,
+    )
+
+    assert not future.query()
+    gather_gate.set()
+    assert future.result(timeout=2) is True
+
+    assert len(calls) == 2
+    assert calls[0]["layers"] == ["layer_0", "layer_1"]
+    assert calls[0]["block_ids"] == [1, 2, 3, 4]
+    assert calls[0]["blocks_in_chunk"] == 2
+    assert calls[0]["blocks_per_window"] == 1
+    assert calls[0]["out"] == [slots[0], slots[1]]
+    assert calls[0]["chunk_indices"] == [0, 1]
+    assert calls[1]["layers"] == ["layer_2"]
+    assert calls[1]["block_ids"] == [5, 6]
+    assert calls[1]["blocks_in_chunk"] == 1
+    assert calls[1]["out"] == [slots[2], slots[3]]
+    # SHM mode: the data is already in the server's slots, so commit sends none.
+    assert fake.commit_arg == []
+    ctx.close()
+
+
+def test_submit_store_multigroup_pickle_stages_per_group_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pickle mode stages each group at its OWN chunk shape and commits
+    group-major, so mixed geometry cannot be flattened to one layout."""
+    gather_gate = threading.Event()
+    gather_gate.set()
+    ctx, calls = _grouped_async_ctx(monkeypatch, gather_gate)
+    pctx = EngineDrivenContextPickle(
+        metadata=MagicMock(), mq_client=MagicMock(), mq_timeout=0.1
+    )
+    monkeypatch.setattr(pctx, "prepare_store", lambda _k, _i: None)
+    committed: dict[str, object] = {}
+
+    def _commit(_key: object, _instance_id: int, chunks: object) -> bool:
+        committed["chunks"] = chunks
+        return True
+
+    monkeypatch.setattr(pctx, "commit_store", _commit)
+    ctx._engine_driven_context = pctx
+
+    future = ctx.submit_store(
+        "req",
+        object(),
+        1,
+        _KV_THREE_LAYERS,
+        [[1, 2, 3, 4], [5, 6]],
+        _FakeEvent(gather_gate),
+        2,
+    )
+    assert future.result(timeout=2) is True
+
+    # Group 0: 4 block ids / 2 blocks per chunk = 2 chunks of its own shape.
+    # Group 1: 2 block ids / 1 block per chunk  = 2 chunks of a different shape.
+    staged = [c["out"] for c in calls]
+    assert [len(s) for s in staged] == [2, 2]
+    assert [s[0].shape for s in staged] == [
+        torch.Size([2, 2, 1, 4]),
+        torch.Size([2, 1, 2, 8]),
+    ]
+    assert all(t.dtype is torch.float16 for s in staged for t in s)
+    assert committed["chunks"] == staged
+    # No slot reservations in pickle mode, so nothing is chunk-index filtered.
+    assert all(c["chunk_indices"] is None for c in calls)
+    ctx.close()
+
+
+def test_submit_store_multigroup_pickle_releases_staging_on_alloc_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A group whose staging cannot be allocated must not lose earlier groups'.
+
+    Pinned host memory is never returned to the OS, so buffers that miss the
+    pool are gone for the process's lifetime -- and a failing allocation is
+    exactly the host-pressure case where that matters most.
+    """
+    gather_gate = threading.Event()
+    gather_gate.set()
+    ctx, calls = _grouped_async_ctx(monkeypatch, gather_gate)
+    pctx = EngineDrivenContextPickle(
+        metadata=MagicMock(), mq_client=MagicMock(), mq_timeout=0.1
+    )
+    monkeypatch.setattr(pctx, "prepare_store", lambda _k, _i: None)
+    ctx._engine_driven_context = pctx
+    monkeypatch.setattr(async_engine_driven.logger, "exception", MagicMock())
+
+    real_alloc = ctx._alloc_pinned_staging
+    allocated: list[torch.Size] = []
+
+    def _alloc(shape: torch.Size, dtype: torch.dtype, count: int) -> list:
+        allocated.append(shape)
+        if len(allocated) == 2:
+            raise RuntimeError("cannot allocate pinned staging")
+        return real_alloc(shape, dtype, count)
+
+    monkeypatch.setattr(ctx, "_alloc_pinned_staging", _alloc)
+
+    future = ctx.submit_store(
+        "req", object(), 1, _KV_THREE_LAYERS, [[1, 2], [5]], _FakeEvent(gather_gate), 2
+    )
+
+    assert future.result(timeout=2) is False
+    assert not calls, "no group may be gathered once staging allocation failed"
+    # Group 0's single chunk (2 block ids / 2 blocks per chunk) is back in the pool.
+    pooled = ctx._staging_pool[(tuple(torch.Size([2, 2, 1, 4])), torch.float16)]
+    assert len(pooled) == 1
+    ctx.close()
+
+
+def test_submit_store_multigroup_group_count_mismatch_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wrong block-id shape must raise on the forward thread, not resolve to
+    a logged False inside a worker thread."""
+    gather_gate = threading.Event()
+    ctx, _ = _grouped_async_ctx(monkeypatch, gather_gate)
+    ctx._engine_driven_context = _FakeGroupedStoreContext(([], [], []))  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeError, match="block-id lists"):
+        ctx.submit_store("req", object(), 1, {}, [[1, 2]], _FakeEvent(gather_gate), 2)
+    ctx.close()
+
+
+def test_submit_store_multigroup_second_group_failure_skips_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A store is all-or-nothing across groups.
+
+    Committing a key whose later groups never gathered is exactly the
+    half-stored corruption that mixed-geometry KV suffered before, so a failing
+    group must abandon the whole key.
+    """
+    gather_gate = threading.Event()
+    gather_gate.set()
+
+    def _fail_on_second(call_index: int) -> object:
+        if call_index == 1:
+            raise RuntimeError("group 1 gather failed")
+        return None
+
+    ctx, calls = _grouped_async_ctx(
+        monkeypatch, gather_gate, gather_impl=_fail_on_second
+    )
+    slots = [torch.zeros(1) for _ in range(4)]
+    fake = _FakeGroupedStoreContext((slots, [0, 1, 0, 1], [0, 0, 1, 1]))
+    ctx._engine_driven_context = fake  # type: ignore[assignment]
+    monkeypatch.setattr(async_engine_driven.logger, "exception", MagicMock())
+
+    future = ctx.submit_store(
+        "req",
+        object(),
+        1,
+        _KV_THREE_LAYERS,
+        [[1, 2, 3, 4], [5, 6]],
+        _FakeEvent(gather_gate),
+        2,
+    )
+
+    assert future.result(timeout=2) is False
+    assert len(calls) == 2
+    assert fake.commit_arg == "not-called"
+    ctx.close()
+
+
+def test_submit_store_multigroup_skips_when_all_chunks_cached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty grouped prepare means every chunk is already stored: the store
+    succeeds without gathering or committing anything."""
+    gather_gate = threading.Event()
+    gather_gate.set()
+    ctx, calls = _grouped_async_ctx(monkeypatch, gather_gate)
+    fake = _FakeGroupedStoreContext(([], [], []))
+    ctx._engine_driven_context = fake  # type: ignore[assignment]
+
+    future = ctx.submit_store(
+        "req",
+        object(),
+        1,
+        _KV_THREE_LAYERS,
+        [[1, 2, 3, 4], [5, 6]],
+        _FakeEvent(gather_gate),
+        2,
+    )
+
+    assert future.result(timeout=2) is True
+    assert calls == []
+    assert fake.commit_arg == "not-called"
     ctx.close()

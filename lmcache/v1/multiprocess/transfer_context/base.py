@@ -183,9 +183,17 @@ class EngineDrivenContext(ABC):
 
     @abstractmethod
     def commit_store(
-        self, key: IPCCacheServerKey, instance_id: int, chunks: list[torch.Tensor]
+        self,
+        key: IPCCacheServerKey,
+        instance_id: int,
+        chunks: "list[torch.Tensor] | list[list[torch.Tensor]]",
     ) -> bool:
-        """Commit store. Pickle: serialize and send. Shm: notify server."""
+        """Commit store. Pickle: serialize and send. Shm: notify server.
+
+        Single-group callers pass a flat chunk list; multi-group callers pass a
+        group-major ``chunks[group][chunk]`` list. SHM mode ignores the payload
+        entirely (the bytes are already in the reserved slots) and takes ``[]``.
+        """
         ...
 
     @abstractmethod

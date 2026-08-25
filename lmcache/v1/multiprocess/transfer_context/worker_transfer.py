@@ -983,6 +983,40 @@ class EngineDrivenTransferContext(TransferContext):
             return picked, None
         return picked, [chunk_indices[i] for i in idxs]
 
+    def _gather_groups(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        group_block_ids: list[list[int]],
+        targets: list[list[torch.Tensor]],
+        chunk_indices: "list[list[int] | None]",
+    ) -> None:
+        """Gather every registered group into its own pre-selected destination.
+
+        Each group is read from its own layers with its own ``blocks_in_chunk``
+        and sliding-window coverage. A group whose target list is empty has
+        nothing to write and is skipped.
+
+        Args:
+            kv_caches: Worker KV cache tensors keyed by layer name.
+            group_block_ids: vLLM block IDs per LMCache KV group.
+            targets: Per-group gather destinations, indexed by group id.
+            chunk_indices: Per-group chunk positions to write, or ``None`` for a
+                group's full chunk sequence.
+        """
+        for gid, state in enumerate(self._group_states):
+            if not targets[gid]:
+                continue
+            gather_paged_kv_to_cpu(
+                {name: kv_caches[name] for name in state.layer_names},
+                group_block_ids[gid],
+                state.blocks_in_chunk,
+                layout_hints=self._layout_hints,
+                engine_kv_format=state.engine_kv_format,
+                out=targets[gid],
+                chunk_indices=chunk_indices[gid],
+                blocks_per_window=state.blocks_per_window,
+            )
+
     def _submit_store_multigroup(
         self,
         key: Any,
@@ -1012,20 +1046,13 @@ class EngineDrivenTransferContext(TransferContext):
         if not tensors:
             future.set_result(True)
             return future
-        for gid, state in enumerate(self._group_states):
+        targets: list[list[torch.Tensor]] = []
+        indices: list[list[int] | None] = []
+        for gid in range(len(self._group_states)):
             out_g, chunks_g = self._group_slots(tensors, group_ids, gid, chunk_indices)
-            if not out_g:
-                continue
-            gather_paged_kv_to_cpu(
-                {name: kv_caches[name] for name in state.layer_names},
-                block_ids[gid],
-                state.blocks_in_chunk,
-                layout_hints=self._layout_hints,
-                engine_kv_format=state.engine_kv_format,
-                out=out_g,
-                chunk_indices=chunks_g,
-                blocks_per_window=state.blocks_per_window,
-            )
+            targets.append(out_g)
+            indices.append(chunks_g)
+        self._gather_groups(kv_caches, block_ids, targets, indices)
         # SHM writes are async device->CPU copies; complete them before commit.
         torch_dev.synchronize()
         ok = ctx.commit_store(key, instance_id, [])

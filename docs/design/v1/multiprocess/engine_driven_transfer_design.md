@@ -72,7 +72,8 @@ State machine overview (worker-side):
     submit_store (lmcache-driven path)         submit_store (engine-driven path)
     -> STORE request (async)          sync:    -> prepare_store -> gather -> commit_store
                                       async:   -> background thread:
-                                                    prepare_store -> gather (copy stream)
+                                                    prepare_store -> gather (copy stream,
+                                                    one pass per KV group)
                                                     -> commit_store
                                                   returns unresolved future
                  |                                               |
@@ -124,10 +125,23 @@ four lifecycle and transfer operations.
 
 `AsyncEngineDrivenTransferContext` async store flow:
 - **submit_store**: performs only O(1) work on the forward thread (registration check
-and block-id flattening), then submits all three phases to a background
+and block-id shape validation), then submits all three phases to a background
 `ThreadPoolExecutor` (`commit_executor`) and returns an unresolved
 `MessagingFuture`
 - **submit_retrieve**: `prepare_retrieve` → `scatter_cpu_to_paged_kv` → `commit_retrieve`
+
+Multi-group (hybrid KV cache) registrations use the same three phases, one gather
+per registered LMCache group:
+- `prepare` calls `prepare_store_grouped` in SHM mode (per-slot tensors, chunk
+  indices and group ids, split per group by `_group_slots`), or the handshake
+  `prepare_store` in pickle mode, where each group is then staged at **its own**
+  chunk shape from `_GroupState.layout_desc` — group shapes differ under mixed KV
+  geometry, so one layout cannot cover them.
+- `gather` runs each group over its own layers with its own `blocks_in_chunk` and
+  `blocks_per_window` (sliding-window coverage). All groups enqueue in order on
+  the single copy stream, so one recorded event covers the whole store.
+- `commit` is all-or-nothing: if any group fails to gather, the key is abandoned
+  rather than committed with partial coverage.
 
 During `register`, worker receives `RegisterEngineDrivenContextResponse(shm_name, pool_size)`
 from server and then calls `create_engine_driven_context(...)` to construct
